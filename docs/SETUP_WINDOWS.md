@@ -7,7 +7,10 @@ details: copy, paste, and compare what you see with what the guide says.
 **Time:** about 1 hour, plus waiting for Google Takeout.
 
 **You need:**
-- A Windows 10 or 11 PC with about 10 GB free on drive C:
+- A Windows 10 or 11 PC with a **64-bit Intel or AMD processor (not ARM)** and about 10 GB
+  free on drive C:. To check: **Start** > **Settings** > **System** > **About**. **System
+  type** must say **x64-based processor**. (ARM PCs, such as Snapdragon "Copilot+" laptops,
+  can't run the app.)
 - The Google account that holds your photos
 - Your GitHub account (the one that owns `patrick-simpson/Google-photos-dedupe`)
 - Notepad, for keeping two codes for a few minutes
@@ -18,6 +21,10 @@ details: copy, paste, and compare what you see with what the guide says.
 - **Paste a command**: copy the gray box from this page, click in the PowerShell window,
   **right-click** (this pastes), then press **Enter**.
 - **Drive**: your Google Drive (drive.google.com).
+- **Tell Claude**: always means the **project chat**, the Claude Code chat on the web
+  (https://claude.ai/code) that runs this project, not the photo-review chat. Never paste
+  photo details, names, places or file names into it: it works on a public repository. See
+  [Two Claudes](../README.md#two-claudes-which-chat-to-use) in the README.
 
 ---
 
@@ -120,18 +127,22 @@ app**. That's expected: it's your own private app, and you're its only user.
 
 ## Part B: Install the tools on your PC
 
-One script installs everything: Git, GitHub CLI, uv (runs Python for the app), and rclone
-1.75.1 (talks to Google Drive). It also downloads the app into `C:\gpclean\app` and the
-photo-search model.
+One script installs everything: Git, GitHub CLI, rclone 1.75.1 (talks to Google Drive),
+and uv 0.8.24 (runs Python for the app; downloaded from its official release and checked
+against a fixed checksum). It also downloads the app into `C:\gpclean\app` and the
+photo-search model. The folder `C:\gpclean` is made private to your Windows account: other
+accounts on this PC can't open it.
 
 1. Open **PowerShell** (Start > type `PowerShell` > **Windows PowerShell**).
 2. Paste these two lines (you can paste both at once) and press **Enter**:
 
    ```powershell
-   Invoke-WebRequest https://raw.githubusercontent.com/patrick-simpson/Google-photos-dedupe/main/tools/setup-windows.ps1 -OutFile "$env:TEMP\setup-windows.ps1" -UseBasicParsing
+   [Net.ServicePointManager]::SecurityProtocol = 'Tls12'; Invoke-WebRequest https://raw.githubusercontent.com/patrick-simpson/Google-photos-dedupe/main/tools/setup-windows.ps1 -OutFile "$env:TEMP\setup-windows.ps1" -UseBasicParsing
    powershell -ExecutionPolicy Bypass -File "$env:TEMP\setup-windows.ps1"
    ```
 
+   If a box warns that you are about to paste text that contains multiple lines, click
+   **Paste anyway**.
 3. Windows may ask **Do you want to allow this app to make changes to your device?**
    once or twice (for Git). Click **Yes**.
 4. Wait 10-20 minutes. Green **OK** lines appear as each step finishes.
@@ -169,6 +180,8 @@ Never email, upload, or share it.
 6. PowerShell prints a block of settings that includes your token. **Don't copy, share, or
    screenshot it.** Type `cls` and press **Enter** to clear the window.
 7. Close Notepad **without saving**.
+8. **Write today's date on a note.** The sign-in stops working 7 days from now (see
+   [The 7-day sign-in](#the-7-day-sign-in-refresh-it-before-it-runs-out)).
 
 **Check:** paste this; it lists your top-level Drive folders:
 
@@ -201,7 +214,7 @@ This proves that gpclean can look at your Drive but **can't change** files it di
    **insufficientFilePermissions**, or **permission denied**. That means it works as it
    should.
    - **No error, and the document disappeared from Drive?** Stop here and tell Claude
-     "the canary delete succeeded". The sign-in has more access than it should. Don't
+     (in the project chat) "the canary delete succeeded". The sign-in has more access than it should. Don't
      continue until it's fixed.
 6. In the browser, delete the test document yourself: in Drive, right-click
    **gpclean-canary** > **Move to trash**.
@@ -271,6 +284,12 @@ your library itself is never touched.
 **First a small test export.** It checks the whole process on real data in about an hour,
 before the big export (which can take a day or more).
 
+**First, check for an old export.** Takeout always saves into a Drive folder named
+**Takeout**, and gpclean reads every zip in the folder it is given. In
+https://drive.google.com, type `Takeout` in the search box at the top. If a folder named
+**Takeout** already exists (from an earlier export), right-click it > **Rename** > type
+`Takeout-old` > **OK**. gpclean ignores it from then on.
+
 ### E1. The test export
 
 1. Open https://takeout.google.com
@@ -295,7 +314,7 @@ before the big export (which can take a day or more).
     `Takeout-test` > **OK**.
     (Takeout always uses the name "Takeout", so renaming keeps the test and the full export
     apart.)
-11. Tell Claude: "The test Takeout is in Drive as Takeout-test."
+11. Tell Claude (in the project chat): "The test Takeout is in Drive as Takeout-test."
 
 ### E2. The full export (later, when Claude says the test looked good)
 
@@ -305,7 +324,10 @@ selected. Still **Google Photos only**, **.zip**, **50 GB**, **Add to Drive**.
 - A big library takes hours to a few days, and arrives as several 50 GB parts in a new
   **Takeout** folder. Leave that folder and its files exactly as they are: don't rename,
   move, or open them.
-- Tell Claude when the email says it's done.
+- Tell Claude (in the project chat) when the email says it's done. Refresh the sign-in
+  first if it is more than a day or two old (see
+  [The 7-day sign-in](#the-7-day-sign-in-refresh-it-before-it-runs-out)): the full run
+  takes hours and needs it the whole time.
 
 ---
 
@@ -313,10 +335,20 @@ selected. Still **Google Photos only**, **.zip**, **50 GB**, **Add to Drive**.
 
 ### What Claude does next
 
-Claude starts the pipeline on GitHub: first a short **probe** (a speed and settings test),
-then the full run on `Takeout-test`, and later on `Takeout`. You'll get a summary in the
-chat. You don't need to watch it. Claude may open small code changes (pull requests)
-for you to merge; see [GITHUB_SETTINGS.md](GITHUB_SETTINGS.md#merging-claudes-changes).
+**Two Claudes.** Everything in this part happens in the **project chat** (the Claude Code
+chat on https://claude.ai/code that runs this project). The **photo-review chat**
+([MCP_GUIDE.md](MCP_GUIDE.md)) only looks at photos and can't start runs. Never paste photo
+details, names, places or file names into the project chat: it works on a public
+repository.
+
+Claude starts the pipeline on GitHub: first a short **probe** (a speed and settings test,
+usually 10-20 minutes), then the run on `Takeout-test` (about 1 hour), and later on
+`Takeout` (several hours; a very big library can take up to two days). The runs happen on
+GitHub, so your PC can be switched off meanwhile. You'll get a summary in the chat. You
+don't need to watch it. Claude may open small code changes (pull requests) for you to
+merge; see [GITHUB_SETTINGS.md](GITHUB_SETTINGS.md#merging-claudes-changes). After you
+merge one, Claude may ask you to update the app on your PC: see
+[Updating the app](#updating-the-app-when-claude-asks-you-to).
 
 ### Download the results and open the review site
 
@@ -329,7 +361,18 @@ When Claude says the bundle is ready:
    ```
 
    It downloads the newest bundle into a new folder under `C:\gpclean\bundle\`, checks
-   every file, and switches gpclean to it. **Check:** it ends with **ALL DONE** in green.
+   every file, and switches gpclean to it. It first prints **Newest bundle:** with the
+   bundle's name (and, for newer runs, the Drive folder and the number of photos); it skips
+   the pipeline's self-tests, which use made-up photos. **Check:** it ends with **ALL DONE**
+   in green.
+   - **Claude gave you a bundle name?** Claude's "bundle is ready" message names the bundle
+     (a code like `2b95fbc56e`). If get-bundle printed a different name, or Claude asks you
+     to fetch a specific one, add `-Cfg` and the name:
+
+     ```powershell
+     powershell -ExecutionPolicy Bypass -File C:\gpclean\app\tools\get-bundle.ps1 -Cfg 2b95fbc56e
+     ```
+
 2. Start the review site. Paste these two lines:
 
    ```powershell
@@ -341,34 +384,71 @@ When Claude says the bundle is ready:
    PowerShell window open while you review. To stop the site, click the window and press
    **Ctrl+C**.
 4. First job: open the **Duplicates** tab and look at about 30 groups by eye. If any group
-   holds photos that are *not* the same, tell Claude.
+   holds photos that are *not* the same, tell Claude in the project chat how many groups
+   were wrong and what kind of difference it was (for example "2 groups mixed two
+   different photos of the same scene"). Don't paste file names or describe who is in them.
 5. Want Claude's help sorting? See [MCP_GUIDE.md](MCP_GUIDE.md).
 
 Next time, you only need step 2. After a new pipeline run, do step 1 again (your "To
-delete" list is kept).
+delete" list is kept). If the review site is still running, stop it (**Ctrl+C**) and start
+it again with step 2 so it shows the new bundle.
+
+---
+
+## Updating the app (when Claude asks you to)
+
+Merged changes on GitHub don't reach your PC by themselves. When Claude asks you to update
+the app (or a message says "Update the app"), paste this in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\gpclean\app\tools\setup-windows.ps1
+```
+
+It downloads the latest version of the app and its packages; finished steps are skipped.
+**Check:** it ends with **ALL DONE** in green. Then stop the review site (**Ctrl+C**) and
+start it again (Part F, step 2), and restart Claude Code or fully quit and reopen Claude
+Desktop.
 
 ---
 
 ## The 7-day sign-in: refresh it before it runs out
 
 Because the Google app stays in **Testing** mode, Google ends the Drive sign-in after
-**7 days**. Refresh it when it's about **5 days old**, before asking Claude for a run and
-before downloading a bundle:
+**7 days**, counted from the day you signed in (Part C, or the last refresh). Refresh it
+**right before asking Claude for a full run**, and **whenever it is 5 or more days old**
+(also before downloading a bundle):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\gpclean\app\tools\refresh-secret.ps1
 ```
 
-A browser opens: sign in with the **same** Google account, click **Continue** on the
-warning page, tick both boxes, and click **Continue**. The script sends the renewed key
-to GitHub. Then tell Claude: "I refreshed the secret, please run the probe." Claude runs
-a quick check; a green **scope check** step confirms the new sign-in works.
+1. The window asks three questions. Type the answer and press **Enter** (just pressing
+   **Enter** also picks the right answer):
+   - **Token already configured - replace it?** > `y`
+   - **Use web browser to automatically authenticate rclone with remote?** > `y`
+   - **Configure this as a Shared Drive (Team Drive)?** > `n` (this one comes after the
+     browser step)
+2. After the second question a browser opens: sign in with the **same** Google account,
+   click **Continue** on the warning page, tick both boxes, and click **Continue**.
+3. The script checks that the sign-in really was renewed (if you answered `n` to the first
+   question it says **NOT renewed**; just run it again) and sends the renewed key to
+   GitHub. It ends with **ALL DONE** and the date the new sign-in runs out: write it down.
+4. Tell Claude (in the project chat): "I refreshed the secret, please run the probe."
+   Claude runs a quick check; a green **scope check** step confirms the new sign-in works.
 
 Always keep using the same `gpclean-desktop` client. Never create a second one.
 
 ---
 
 ## Troubleshooting
+
+**"Could not create SSL/TLS secure channel" (Part B, first line)**
+Older Windows 10 can't reach GitHub securely yet. Run **Windows Update** (Start >
+**Settings** > **Update & Security** > **Check for updates**), install everything, restart,
+and paste both lines of Part B again.
+
+**"This PC has a 'ARM64' processor"**
+gpclean needs a 64-bit Intel or AMD PC. Use another PC for the setup and review.
 
 **"winget is not recognized" / "winget is missing"**
 Open the **Microsoft Store**, search for **App Installer**, click **Get** or **Update**.
@@ -381,9 +461,24 @@ Use the exact commands in this guide; they start with
 **"uv" / "rclone" / "gh" / "git" is not recognized**
 Close PowerShell and open a new window. Still wrong? Run Part B again.
 
-**Setup stopped at "uv sync" or "fetch-model"**
+**Setup stopped at "uv sync", "Installing uv" or "fetch-model"**
 Usually a network hiccup. Run the second line of Part B again; it continues where it
 stopped.
+
+**Setup says "Another uv (...) is found before C:\gpclean\bin"**
+Another copy of uv, installed for all users of the PC, would be used instead of the app's
+checked one. Uninstall it (for example `winget uninstall astral-sh.uv`, or in **Settings** >
+**Apps**), close PowerShell, open a new window and run the setup again.
+
+**Setup stopped at "Making C:\gpclean private" (Access is denied)**
+`C:\gpclean` was created from an administrator window. Right-click **Start** > **Windows
+PowerShell (Admin)** (or **Terminal (Admin)**), click **Yes**, paste this one line, then
+close that window and run the setup again from a normal window:
+`icacls C:\gpclean /setowner "$env:USERDOMAIN\$env:USERNAME" /T /Q`
+
+**Setup stopped at "Updating the app (git pull)"**
+Something in `C:\gpclean\app` was changed by hand. Tell Claude (in the project chat) the
+lines printed above the red message.
 
 **Google says "Access blocked: gpclean has not completed the Google verification process"**
 You aren't listed as a test user, or you signed in with a different account. Redo A4 with
@@ -394,20 +489,24 @@ The client isn't a **Desktop app**, or the ID/secret was mistyped. Open **Google
 Platform > Clients**, click **gpclean-desktop**, and copy the **Client ID** again. For the
 secret, click **Add secret** on that **same** client. Then redo C1. Don't create a second
 client: files gpclean already made in Drive only work with the client that made them. If
-you really need a new client, tell Claude first.
+you really need a new client, tell Claude (in the project chat) first.
 
 **rclone says "invalid_grant", "token expired", or "couldn't fetch token"**
 The 7-day sign-in ran out. Run `refresh-secret.ps1` (see above).
 
 **"The canary delete succeeded" (the test document was deleted)**
-Stop and tell Claude. Don't upload the secret or run anything until it's fixed.
+Stop and tell Claude (in the project chat). Don't upload the secret or run anything until it's fixed.
 
-**get-bundle says "No finished bundle found on Drive yet"**
-The pipeline hasn't finished. Wait until Claude says the run is done.
+**get-bundle says "No finished bundle found on Drive yet" or "Only self-test bundles"**
+The pipeline hasn't finished a run on your Takeout. Wait until Claude says the run is done.
 
 **get-bundle says the bundle is incomplete or damaged**
-Run get-bundle again; it starts a fresh folder. Old folders under `C:\gpclean\bundle\` can
-be deleted once the new one works.
+Run get-bundle again; it starts a fresh folder.
+
+**Freeing space: deleting old bundles**
+Old folders under `C:\gpclean\bundle\` can be deleted once the new one works. First stop
+the review site (**Ctrl+C**) and fully quit Claude Desktop and Claude Code; otherwise
+Windows says the file is in use.
 
 **The site says "No bundle configured"**
 Run get-bundle (Part F, step 1) first.
@@ -418,16 +517,18 @@ Maybe it's already running in another PowerShell window. Or start it on another 
 
 **Windows Defender or antivirus warns about a file**
 The app and model files are downloaded from GitHub, PyPI, and Hugging Face and checked
-against fixed checksums. If a warning names a file under `C:\gpclean`, tell Claude the exact
-message.
+against fixed checksums. If a warning names a file under `C:\gpclean`, tell Claude (in the
+project chat) the exact message.
 
 **Where things are on your PC**
 - `C:\gpclean\app`: the app
+- `C:\gpclean\bin`: uv (the app's checked copy)
 - `C:\gpclean\bundle\...`: downloaded bundles
 - `C:\gpclean\state`: your "To delete" list and logs
 - `C:\gpclean\review`: the folder for Claude Code reviews
 - `C:\gpclean\ci-rclone.conf`: your Drive key (private!)
 - `%USERPROFILE%\.cache\huggingface\gpclean`: the photo-search model (about 600 MB)
 - `%LOCALAPPDATA%\uv\cache`: uv's download cache (several GB; `uv cache clean` empties it)
+- `%APPDATA%\uv\python`: the Python that uv installed for the app
 
 Keep all of it outside OneDrive. `C:\gpclean` is outside OneDrive by default.

@@ -17,12 +17,19 @@ Drive layout under ``<remote>:<out_root>`` (default ``gp:gpclean-output``)::
 
     state/<cfg>/shards.json                        the shard table (private: has zip names)
     state/<cfg>/quota-<run>-<attempt>-p<pass>-w<worker>.flag
-    work/<cfg>/<zipkey>/<shard:04d>.meta.sqlite     per-shard checkpoint (written last)
+    work/<cfg>/<zipkey>/<shard:04d>.meta.sqlite     per-shard checkpoint (written last;
+                                                   0 bytes = rejected by a merge, rescan it)
     bundle/<cfg>/thumbs/<zipkey>-<shard:04d>.sqlite thumb packs (written before the meta)
     bundle/<cfg>/{index.sqlite, embeddings.f16.npy, manifest.json}
     logs/<run>-<attempt>/<job>/                    private logs
     probe/<run>/                                   probe details
     selftest/                                      fixture zips for mode=selftest
+
+A shard counts as done when its meta file exists and is not empty. The merge cannot
+delete anything on Drive (the rclone wrapper denies it), so when it finds a checkpoint it
+cannot use (not SQLite, another cfg or pack, its pack missing or not matching the listed
+hash) it overwrites the meta with a 0-byte *tombstone*. The next pass (or run) then sees the
+shard as pending again and its rescan overwrites both the pack and the tombstone.
 
 Shard ids are positions in ``shards.json``. A later plan only appends (new zips get new
 ids at the end), so ids never change. A zip that is no longer in the folder stays in the
@@ -42,10 +49,10 @@ is hashed into ``cfg``, and two workflow files carrying it could drift apart.
 
 Thumb-pack integrity: the merge compares each pack's hash in the Drive listing
 (``lsjson --hash``) with the one its meta recorded, preferring ``pack_md5`` (Drive's
-md5Checksum, always present) and falling back to ``pack_sha256`` when the backend lists one.
-Deviation from PLAN §2 until ``scan.scan_shard`` records ``pack_md5``: on Drive, whose
-sha256Checksum is not always populated, a pack whose listing has no comparable hash is only
-checked for presence here; ``verify-bundle`` on the PC re-hashes every pack anyway.
+md5Checksum, always present; ``scan.scan_shard`` records it next to ``pack_sha256``) and
+falling back to ``pack_sha256`` when the backend lists one. A checkpoint written before
+``pack_md5`` existed, on a backend that lists no sha256, is only checked for size here;
+``verify-bundle`` on the PC re-hashes every pack anyway.
 """
 
 from __future__ import annotations
@@ -71,8 +78,8 @@ from zoneinfo import ZoneInfo
 from gpclean import publiclog
 from gpclean.config import CLIP_MODELS, THRESHOLD_CHOICES, ScanConfig, parse_bool, validate_folder
 from gpclean.publiclog import Ev
-from gpclean.rclone import QuotaError, Rclone
-from gpclean.store import RcloneStore
+from gpclean.rclone import QuotaError, Rclone, RcloneError
+from gpclean.store import RcloneStore, check_rel
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +103,9 @@ DEFAULT_JOB_BUDGET_MIN = 330       # stop *starting* shards after 5 h 30 m
 HARD_STOP_EXTRA_MIN = 12
 MAX_CONSECUTIVE_ERRORS = 3         # a dying backend fails every shard; stop early
 SELFTEST_DIR = "selftest"
-SELFTEST_PHOTOS_PER_SHARD = 25
+# ScanConfig's minimum: the small fixture zips (44, 33 and 5 photos) then make 8 shards, so
+# the selftest covers shards that start mid-zip and several packs per zip.
+SELFTEST_PHOTOS_PER_SHARD = 10
 SELFTEST_FAIL_SHARD = 1            # pass 1 fails this shard on purpose; pass 2 must redo it
 SHARDS_FORMAT = 1
 # Google resets daily API quotas at midnight Pacific time.
@@ -588,14 +597,49 @@ def present_shards(table: dict) -> list[dict]:
     return [s for s in table["shards"] if s["zipkey"] in keys]
 
 
+def list_sizes(store, rel_dir: str) -> dict[str, int]:
+    """``{path relative to rel_dir: size in bytes}`` of every file below ``rel_dir``.
+
+    Like ``store.list`` (recursive; a missing folder lists as empty) but with sizes, which
+    ``done_set`` needs to tell a tombstone from a checkpoint. The stores have no such call
+    yet, so this uses one if a store grows it and otherwise asks the backend directly.
+    """
+    lister = getattr(store, "list_sizes", None)
+    if callable(lister):
+        return dict(lister(rel_dir))
+    rel = check_rel(rel_dir)
+    if isinstance(store, RcloneStore):
+        try:
+            entries = store.rclone.lsjson(f"{store.remote_root}/{rel}", recursive=True,
+                                          files_only=True)
+        except QuotaError:
+            raise
+        except RcloneError as exc:
+            if exc.returncode == 3:  # directory not found
+                return {}
+            raise
+        return {e["Path"]: int(e.get("Size", -1)) for e in entries
+                if isinstance(e.get("Path"), str) and not e.get("IsDir")}
+    base = Path(store.root) / rel  # a LocalStore (run-local and tests)
+    return {name: (base / name).stat().st_size for name in store.list(rel)}
+
+
 def done_set(store, cfg: str) -> set[tuple[str, int]]:
-    """(zipkey, shard) of every meta checkpoint on Drive."""
+    """(zipkey, shard) of every meta checkpoint on Drive, tombstones (0 bytes) excluded."""
     done = set()
-    for rel in store.list(f"work/{cfg}"):
+    for rel, size in list_sizes(store, f"work/{cfg}").items():
         m = _META_REL_RE.fullmatch(rel)
-        if m:
+        if m and size != 0:
             done.add((m.group(1), int(m.group(2))))
     return done
+
+
+def tombstone(store, cfg: str, zipkey: str, shard: int) -> None:
+    """Overwrite a shard's meta with 0 bytes so the next pass rescans it (see done_set)."""
+    with tempfile.TemporaryDirectory(prefix="gpclean-") as tmp:
+        empty = Path(tmp) / "tombstone"
+        empty.write_bytes(b"")
+        store.put(empty, meta_rel(cfg, zipkey, shard))
 
 
 def pending_ids(table: dict, done: set[tuple[str, int]]) -> list[int]:
@@ -811,43 +855,50 @@ def _scan_shards(env: CiEnv, rc: Rclone, store, worker: int, of: int, tally: _Ta
     publiclog.event(Ev.PHASE_START, phase=PHASE_SCAN, total=tally.total)
     if not mine:
         return
-    if env.clip_model != "none":
-        # Once per job, before any worker process starts (they only load the file).
-        from gpclean.clipmodel import fetch_model
+    from gpclean.scan import ScanPool
 
-        fetch_model(env.clip_model)
     zips = {z["zipkey"]: z for z in table["zips"]}
     consecutive = 0
-    with rc.serve_http(env.source) as base, \
-            tempfile.TemporaryDirectory(prefix="gpclean-scan-") as tmp:
-        cache = _ZipCache(base, zips)
-        for sid in mine:
-            if _clock() >= budget_end:
-                log.info("job budget used up; leaving the rest to the next pass")
-                break
-            try:
-                _scan_one(env, cache, store, shards[sid], Path(tmp), fail=(sid == fail_id),
-                          deadline=min(_clock() + SHARD_TIMEOUT_S, hard_stop))
-                tally.done += 1
-                consecutive = 0
-            except SelftestFailure:
-                log.info("selftest: shard %d failed on purpose", sid)
-                tally.errors += 1
-            except Exception as exc:
-                raise_if_quota(rc, exc)
-                log.warning("shard %d failed: %s", sid, type(exc).__name__, exc_info=True)
-                tally.errors += 1
-                consecutive += 1
-            publiclog.event(Ev.PROGRESS, phase=PHASE_SCAN, done=tally.done, total=tally.total,
-                            errors=tally.errors)
-            if consecutive >= MAX_CONSECUTIVE_ERRORS:
-                log.warning("too many failures in a row; stopping this worker")
-                break
+    # One pool for the whole job: each worker process starts and loads CLIP once, not once
+    # per shard. A shard that times out or loses a worker leaves the pool usable.
+    with ScanPool(env.scan_procs, env.scan_cfg, env.clip_model) as pool:
+        # Fetch and verify the CLIP weights once, before any worker process starts (they
+        # only load the verified file), so a bad model fails the job before the first shard.
+        pool.prepare()
+        with rc.serve_http(env.source) as base, \
+                tempfile.TemporaryDirectory(prefix="gpclean-scan-") as tmp:
+            cache = _ZipCache(base, zips)
+            for sid in mine:
+                if _clock() >= budget_end:
+                    log.info("job budget used up; leaving the rest to the next pass")
+                    break
+                try:
+                    _scan_one(env, cache, store, shards[sid], Path(tmp), pool=pool,
+                              fail=(sid == fail_id),
+                              deadline=min(_clock() + SHARD_TIMEOUT_S, hard_stop))
+                    tally.done += 1
+                    consecutive = 0
+                except SelftestFailure:
+                    log.info("selftest: shard %d failed on purpose", sid)
+                    tally.errors += 1
+                except Exception as exc:
+                    raise_if_quota(rc, exc)
+                    log.warning("shard %d failed: %s", sid, type(exc).__name__, exc_info=True)
+                    tally.errors += 1
+                    consecutive += 1
+                publiclog.event(Ev.PROGRESS, phase=PHASE_SCAN, done=tally.done,
+                                total=tally.total, errors=tally.errors)
+                if consecutive >= MAX_CONSECUTIVE_ERRORS:
+                    log.warning("too many failures in a row; stopping this worker")
+                    break
 
 
-def _scan_one(env: CiEnv, cache: _ZipCache, store, s: dict, tmp: Path, *, fail: bool,
-              deadline: float) -> None:
-    """Scan one shard to temp files, then upload the pack and, last, the meta checkpoint."""
+def _scan_one(env: CiEnv, cache: _ZipCache, store, s: dict, tmp: Path, *, pool,
+              fail: bool, deadline: float) -> None:
+    """Scan one shard to temp files, then upload the pack and, last, the meta checkpoint.
+
+    ``pool`` is the job's ``scan.ScanPool`` (made for ``env.scan_cfg`` and ``env.clip_model``).
+    """
     from gpclean.scan import ShardSpec, scan_shard
 
     if fail:
@@ -862,7 +913,7 @@ def _scan_one(env: CiEnv, cache: _ZipCache, store, s: dict, tmp: Path, *, fail: 
     try:
         scan_shard(opener, spec, entries, env.scan_cfg, meta_path=meta_local,
                    pack_path=pack_local, workers=env.scan_procs, embedder_name=env.clip_model,
-                   deadline=deadline)
+                   deadline=deadline, pool=pool)
         # Pack first, meta last: the meta file on Drive is the "shard done" checkpoint.
         store.put(pack_local, pack_rel(env.cfg, s["zipkey"], s["shard"]))
         store.put(meta_local, meta_rel(env.cfg, s["zipkey"], s["shard"]))
@@ -951,31 +1002,40 @@ def _merge(env: CiEnv) -> int:
         tmp = Path(tmp_name)
         metas: list[Path] = []
         pack_hashes: dict[str, dict] = {}
+        rejected = 0
         for s in present:
             key, shard = s["zipkey"], s["shard"]
             name = pack_name(key, shard)
-            if (key, shard) not in done or name not in packs:
+            if (key, shard) not in done:
                 continue
-            local = tmp / "meta" / key / f"{shard:04d}.meta.sqlite"
-            store.get(meta_rel(cfg, key, shard), local)
-            # A bad checkpoint (not SQLite, no shard_info, another cfg, another pack) makes
-            # the shard count as missing: the bundle is marked partial and the next pass
-            # rescans it. It must not abort the whole merge.
-            info = read_shard_info(local)
-            if not info or info.get("cfg") != cfg or info.get("pack_name", name) != name \
-                    or not info.get("pack_sha256"):
-                log.warning("shard %d: checkpoint unreadable or does not match its table entry",
-                            s["id"])
-                continue
-            if not pack_matches_listing(info, packs[name]):
-                log.warning("shard %d: thumb pack on Drive does not match its checkpoint",
-                            s["id"])
+            # A bad checkpoint (its pack missing, not SQLite, no shard_info, another cfg or
+            # pack, a pack that does not match the listed hash) makes the shard count as
+            # missing, so the bundle is marked partial. It must not abort the whole merge,
+            # and it is tombstoned so the next pass (or run) rescans the shard.
+            problem = None
+            if name not in packs:
+                problem = "its thumb pack is not on Drive"
+            else:
+                local = tmp / "meta" / key / f"{shard:04d}.meta.sqlite"
+                store.get(meta_rel(cfg, key, shard), local)
+                info = read_shard_info(local)
+                if not info or info.get("cfg") != cfg or info.get("pack_name", name) != name \
+                        or not info.get("pack_sha256"):
+                    problem = "checkpoint unreadable or does not match its table entry"
+                elif not pack_matches_listing(info, packs[name]):
+                    problem = "thumb pack on Drive does not match its checkpoint"
+            if problem:
+                log.warning("shard %d: %s; marked for a rescan", s["id"], problem)
+                tombstone(store, cfg, key, shard)
+                rejected += 1
                 continue
             pack_hashes[name] = {"sha256": info["pack_sha256"],
                                  "size": int(info.get("pack_size") or 0) or None}
             metas.append(local)
 
         missing = len(present) - len(metas)
+        if rejected:
+            publiclog.event(Ev.COUNT, phase=PHASE_MERGE, rejected=rejected)
         if not metas:
             log.warning("no finished shards: nothing to merge")
             publiclog.event(Ev.COUNT, phase=PHASE_MERGE, shards=0, missing=missing)
@@ -986,6 +1046,13 @@ def _merge(env: CiEnv) -> int:
         manifest = build_bundle(metas, None, out, MergeConfig(threshold=env.threshold),
                                 cfg_hash=cfg, clip_model=env.clip_model,
                                 expected_shards=len(present), pack_hashes=pack_hashes)
+        # Record which run produced this bundle so tools/get-bundle.ps1 can skip selftest
+        # bundles explicitly instead of guessing. The folder is the user's own workflow input.
+        manifest["mode"] = env.mode
+        if env.mode != "selftest":
+            manifest["folder"] = env.folder
+        (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n",
+                                         encoding="utf-8")
         for name in (INDEX_NAME, EMB_NAME, MANIFEST_NAME):  # manifest LAST
             store.put(out / name, f"bundle/{cfg}/{name}")
 

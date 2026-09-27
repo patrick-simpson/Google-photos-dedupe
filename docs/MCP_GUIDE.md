@@ -13,6 +13,12 @@ Photos. Every proposal waits for you in the review site (**To delete** > **Propo
 You can use **Claude Code** (a terminal app), **Claude Desktop**, or both. Set up
 gpclean first ([SETUP_WINDOWS.md](SETUP_WINDOWS.md), through Part F).
 
+This guide sets up the **photo-review chat**. It is not the **project chat** (the Claude
+Code chat on https://claude.ai/code that runs the pipeline and opens pull requests; see
+[Two Claudes](../README.md#two-claudes-which-chat-to-use)). Keep photo details in the
+review chat only: never paste them into the project chat, which works on a public
+repository.
+
 ---
 
 ## Step 1: Get your personal setup text
@@ -84,7 +90,7 @@ can't see your photos.)
 1. Open **Claude Desktop**.
 2. Open **Settings**: click your name or initials at the bottom left, then **Settings**
    (or use the menu **File** > **Settings**).
-3. In the left list, click **Developer**, then click **Edit Config**.
+3. In the left list, under **Desktop app**, click **Developer**, then click **Edit Config**.
    - No **Developer** item? Use the menu **Help** > **Troubleshooting** > **Enable
      Developer Mode**, then try again.
 4. A File Explorer window opens with the file **claude_desktop_config.json** selected.
@@ -114,8 +120,9 @@ can't see your photos.)
 6. **File** > **Save**, and close Notepad.
 7. **Fully quit** Claude Desktop: right-click the Claude icon near the clock (bottom right;
    click **^** if you don't see it) > **Quit**. Then start Claude Desktop again.
-8. Start a new chat. Click the **Search and tools** button (the slider icon below the
-   message box). **gpclean** should be listed and switched on.
+8. Start a new chat. Click the **+** button at the bottom left of the message box, then
+   **Connectors** (older versions: the slider icon **Search and tools** below the message
+   box). **gpclean** should be listed and switched on.
 9. Type: `show me gpclean stats`. When Claude asks to use a gpclean tool, click **Allow
    always** (the tools can only read and propose).
 
@@ -129,10 +136,11 @@ see [Troubleshooting](#troubleshooting).
 Before your first review chat, take two minutes for these:
 
 - **Turn off other connectors and web search in review chats.** In Claude Desktop: in each
-  photo-review chat, open **Search and tools** and switch off **Web search** and every other
-  connector (Gmail, Google Drive, Calendar, ...), leaving only **gpclean**. Text inside a
-  photo could try to trick Claude; with nothing else switched on, there's nothing else it
-  can reach. (Claude Code's review folder already blocks web, shell, files, and claude.ai
+  photo-review chat, click the **+** button at the bottom left of the message box. Switch
+  off **Web search** there, then open **Connectors** and switch off every other connector
+  (Gmail, Google Drive, Calendar, ...), leaving only **gpclean**. (Older versions: the
+  slider icon **Search and tools**.) Text inside a photo could try to trick Claude; with
+  nothing else switched on, there's nothing else it can reach. (Claude Code's review folder already blocks web, shell, files, and claude.ai
   connectors.)
 - **Check your Claude privacy setting.** On claude.ai or in Claude Desktop: **Settings** >
   **Privacy** > **Help improve Claude**. If it's on, your chats may be used to train
@@ -142,7 +150,8 @@ Before your first review chat, take two minutes for these:
   locations or names" at the start of a chat.
 - **When you're finished,** delete the photo-review chats (see the teardown checklist in
   the [README](../README.md#teardown-checklist-when-you-are-completely-finished)).
-- When you're not reviewing, you can switch **gpclean** off in **Search and tools**.
+- When you're not reviewing, you can switch **gpclean** off in **+** > **Connectors**
+  (older versions: **Search and tools**).
 
 ---
 
@@ -210,15 +219,23 @@ around them: replace ` -- ` with ` '--' ` in the line and try again.
 - Check the JSON: every backslash must be doubled (`C:\\gpclean`), and all quotes must be
   straight quotes (`"`), not curly ones. Paste the block again from `gpclean mcp-config`.
 - Make sure you fully quit Claude Desktop (tray icon > **Quit**) and restarted it.
-- The server writes a log to `C:\gpclean\state\logs\`. If it still fails, tell Claude the
-  error message shown in **Settings** > **Developer**.
+- The server writes a log to `C:\gpclean\state\logs\`. If it still fails, tell Claude (in
+  the project chat) the error message shown in **Settings** > **Developer**.
 
-**Claude says "No bundle configured"**
+**Claude says "No review bundle is configured yet"**
 Download a bundle first: [SETUP_WINDOWS.md, Part F](SETUP_WINDOWS.md#part-f-let-claude-run-it-then-review-on-your-pc).
 
-**After downloading a new bundle, Claude still sees the old one**
-Restart Claude Code (type `/exit`, then `claude`) or fully quit and reopen Claude Desktop.
+**After downloading a new bundle**
+Claude switches to the new bundle by itself on its next request. Photo numbers (ids) from
+before the switch no longer match, so Claude is told to search again; the simplest is to
+start a new chat. If Claude still sees the old one, restart Claude Code (type `/exit`, then
+`claude`) or fully quit and reopen Claude Desktop.
 
 **Text search says it isn't available**
-The search model wasn't downloaded. Run:
-`cd C:\gpclean\app` and then `uv run gpclean fetch-model --model b32`.
+- It says the CLIP weights are not downloaded: the search model is missing. Run
+  `cd C:\gpclean\app` and then `uv run gpclean fetch-model --model b32`, then ask again.
+- It says the CLIP libraries are not installed: run the setup again
+  ([Updating the app](SETUP_WINDOWS.md#updating-the-app-when-claude-asks-you-to)), then
+  restart Claude (see above).
+- It says the bundle was built without CLIP embeddings: that bundle has no text search.
+  Filters (category, year, dates, file names) still work.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 
 import numpy as np
@@ -10,6 +11,7 @@ import pytest
 from shard_factory import image_cols, textured
 
 from gpclean.config import MergeConfig
+from gpclean.imaging.fingerprint import sig_distance
 from gpclean.merge.group import (
     DupItem,
     aspect_ok,
@@ -23,7 +25,10 @@ from gpclean.merge.group import (
     is_graphic,
     keeper_key,
     near_candidates,
+    sig_metrics_batch,
 )
+from gpclean.merge import group as group_mod
+from gpclean.merge.group import _Checker
 
 CFG = MergeConfig()
 SIG_N = 1152
@@ -147,12 +152,46 @@ def test_pigeonhole_finds_exactly_the_brute_force_pairs(threshold):
     assert stats["skipped_buckets"] == 0
 
 
-def test_chunks_cover_64_bits():
+def test_chunks_cover_bits_1_to_63_and_never_bit_0():
     for t in (2, 3, 4, 5):
         bounds = chunk_bounds(t)
         assert len(bounds) == t + 1
-        assert sum(w for _s, w in bounds) == 64
-        assert [s for s, _w in bounds] == [sum(w for _s, w in bounds[:k]) for k in range(t + 1)]
+        assert sum(w for _s, w in bounds) == 63
+        # Contiguous, starting at bit 1: bit 0 (the DC term, always set) is in no chunk.
+        assert [s for s, _w in bounds] == [1 + sum(w for _s, w in bounds[:k])
+                                           for k in range(t + 1)]
+        assert all(s >= 1 for s, _w in bounds)
+        assert max(w for _s, w in bounds) - min(w for _s, w in bounds) <= 1
+    with pytest.raises(ValueError):
+        chunk_bounds(63)
+
+
+@pytest.mark.parametrize("threshold", [2, 3, 4, 5])
+def test_pigeonhole_with_constant_dc_bit_and_bit_0_flips(threshold):
+    """Real pHashes have bit 0 set; pairs whose only differences include bit 0 are still found
+    (the final check counts all 64 bits), and the sets equal the brute-force reference."""
+    rng = np.random.default_rng(100 + threshold)
+    ph = _hashes(rng, 1200, 0)
+    ph = ph | np.int64(1)  # DC bit set, as for every non-black image
+    extra = [_flip(int(ph[k]), [0, *rng.choice(np.arange(1, 64), threshold - 1, replace=False)])
+             for k in rng.integers(0, ph.size, 300)]
+    extra += [_flip(int(ph[k]), [0]) for k in rng.integers(0, ph.size, 50)]
+    ph = np.concatenate([ph, np.array(extra, dtype=np.int64)])
+    eligible = np.ones(ph.size, bool)
+    pairs, stats = near_candidates(ph, eligible, threshold, bucket_cap=10**6)
+    want = brute_candidates(ph, eligible, threshold)
+    assert pairs.shape[0] >= 350
+    assert np.array_equal(pairs, want)
+    assert stats["skipped_buckets"] == 0 and stats["over_candidate_warn"] == 0
+
+
+def test_candidate_warning_is_count_only(monkeypatch, caplog):
+    monkeypatch.setattr(group_mod, "CANDIDATE_WARN_PAIRS", 10)
+    ph = np.zeros(12, dtype=np.int64)
+    with caplog.at_level(logging.WARNING, logger="gpclean.merge.group"):
+        pairs, stats = near_candidates(ph, np.ones(12, bool), 3, bucket_cap=100)
+    assert pairs.shape[0] == 66 and stats["over_candidate_warn"] == 1
+    assert any("66 candidate pairs" in r.getMessage() for r in caplog.records)
 
 
 def test_big_buckets_are_skipped_and_counted():
@@ -161,6 +200,7 @@ def test_big_buckets_are_skipped_and_counted():
     pairs, stats = near_candidates(ph, np.ones(12, bool), 3, bucket_cap=10)
     assert pairs.shape[0] == 0
     assert stats["skipped_buckets"] == 4 and stats["skipped_bucket_items"] == 48
+    assert stats["over_candidate_warn"] == 0
     assert stats["unexamined_pairs"] == 4 * 66
     pairs, stats = near_candidates(ph, np.ones(12, bool), 3, bucket_cap=12)
     assert pairs.shape[0] == 66 and stats["skipped_buckets"] == 0
@@ -229,6 +269,101 @@ def test_find_groups_equals_brute_force_oracle(threshold):
                     continue
                 assert not other.is_graphic
                 assert any(not items[t].is_graphic for t in seed_class)
+
+
+def test_sig_metrics_batch_equals_sig_distance_exactly():
+    rng = np.random.default_rng(21)
+    base = rng.integers(0, 256, SIG_N)
+    sigs = [_sig(rng) for _ in range(40)]
+    sigs += [_sig(rng, base, noise=int(rng.integers(0, 30))) for _ in range(40)]
+    sigs += [bytes(SIG_N), bytes([255] * SIG_N)]  # extremes: every difference is 255
+    mat = np.frombuffer(b"".join(sigs), dtype=np.uint8).reshape(len(sigs), SIG_N)
+    a = rng.integers(0, len(sigs), 3000)
+    b = rng.integers(0, len(sigs), 3000)
+    a[:2], b[:2] = [len(sigs) - 2, 0], [len(sigs) - 1, 0]
+    got = sig_metrics_batch(mat, a, b)
+    want = np.array([sig_distance(sigs[i], sigs[j]) for i, j in zip(a.tolist(), b.tolist())])
+    assert np.array_equal(got, want)  # identical, not merely close
+    assert tuple(got[0]) == (255.0, 255.0, 255.0) and tuple(got[1]) == (0.0, 0.0, 0.0)
+
+
+def _scalar_near(a: DupItem, b: DupItem, cfg: MergeConfig) -> str | None:
+    """The reference: the scalar edge checks in order. Returns None for a near edge, else
+    "skip" (not eligible / too far in pHash, not counted) or the first failing check."""
+    if a.sha256 is not None and a.sha256 == b.sha256:
+        return "skip"
+    if a.is_graphic or b.is_graphic or a.phash64 is None or b.phash64 is None:
+        return "skip"
+    if group_mod.hamming64(a.phash64, b.phash64) > cfg.threshold:
+        return "skip"
+    if not aspect_ok(a, b, cfg.aspect_tol):
+        return "aspect"
+    if a.sig is None or b.sig is None:
+        return "sig"
+    mad, block, chroma = sig_distance(a.sig, b.sig)
+    if not (mad <= cfg.sig_mad_max and block <= cfg.sig_block_max
+            and chroma <= cfg.sig_chroma_max):
+        return "sig"
+    return None if capture_ok(a, b, cfg) else "capture"
+
+
+def test_batched_verification_equals_the_scalar_checks():
+    """_Checker (numpy) accepts exactly the pairs the scalar checks accept, with the same
+    rejection counts by first failing check, over a library that exercises every check."""
+    rng = np.random.default_rng(22)
+    base = rng.integers(40, 216, SIG_N)
+    t0 = 1_500_000_000
+    offsets = [0, 1, 2, 60, 61, 3600, 3601, 7200, 10**6]
+    items = []
+    for k in range(200):
+        kind = k % 8
+        items.append(item(
+            f"i{k}", _flip(0, rng.choice(64, int(rng.integers(0, 6)), replace=False)),
+            _sig(rng, base, noise=int(rng.integers(0, 9))) if kind != 1 else _sig(rng),
+            w=[400, 300, 402, 0][(k // 8) % 4] if kind == 2 else 400, h=300,
+            graphic=kind == 3,
+            capture=t0 + int(rng.choice(offsets)) if kind in (4, 5, 7) else None,
+            subsec=[0.25, 0.5, None][k % 3] if kind in (5, 7) else None,
+            sha=hashlib.sha256(b"same").digest() if kind == 6 and k % 16 == 6 else None))
+    items.append(DupItem(uid="nosig", sha256=None, phash64=0, sig=None, width=400, height=300,
+                         is_graphic=False, capture_s=None, subsec=None, url=None,
+                         keeper_key=(0, "nosig")))
+    n = len(items)
+    pairs = np.array([(i, j) for i in range(n) for j in range(i + 1, n)], dtype=np.int64)
+    cfg = MergeConfig(threshold=4)
+    chk = _Checker(items, cfg, 4, np.arange(n))
+    ei, ej = chk.verify_pairs(pairs)
+    verdicts = [_scalar_near(items[i], items[j], cfg) for i, j in pairs.tolist()]
+    want = [p for p, v in zip(pairs.tolist(), verdicts) if v is None]
+    assert list(zip(ei.tolist(), ej.tolist())) == [tuple(p) for p in want]
+    assert len(want) > 100
+    counts = {r: verdicts.count(r) for r in ("aspect", "sig", "capture")}
+    assert all(counts.values()), counts
+    assert dict(chk.rejected) == counts
+    # The seed metrics equal sig_distance; None where a side has no signature.
+    got = chk.metrics(0, [1, 2, n - 1])
+    assert got[:2] == [sig_distance(items[0].sig, items[k].sig) for k in (1, 2)]
+    assert got[2] is None
+
+
+def test_dense_phash_clusters_verify_quickly():
+    """Two clusters of 400 near-identical hashes (over 120k candidate pairs, all needing a
+    signature check) take seconds, not minutes."""
+    rng = np.random.default_rng(23)
+    items = []
+    for c in range(2):
+        h0 = int(rng.integers(-2**63, 2**63 - 1))
+        base = rng.integers(40, 216, SIG_N)
+        for m in range(400):
+            items.append(item(f"c{c}m{m}", _flip(h0, rng.choice(64, int(rng.integers(0, 3)),
+                                                                   replace=False)),
+                              _sig(rng, base if m % 2 else None, noise=1), rank=m))
+    t0 = time.perf_counter()
+    groups, stats = find_groups(items, CFG)
+    elapsed = time.perf_counter() - t0
+    assert stats["candidate_pairs"] >= 120_000 and stats["rejected_sig"] > 0
+    assert len(groups) >= 2
+    assert elapsed < 30  # about a second; it was about 70 us per pair in scalar Python
 
 
 def test_anti_chaining_splits_a_chain():

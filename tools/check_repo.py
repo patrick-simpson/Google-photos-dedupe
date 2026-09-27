@@ -91,6 +91,18 @@ RUN_KEY_RE = re.compile(r"^(\s*(?:-\s+)?)[\"']?run[\"']?\s*:\s*(.*)$")
 # github.head_ref, env copied from inputs...). Matrix values are integers set in the
 # workflow itself, so a bare ``${{ matrix.x }}`` is the one exception.
 EXPR_IN_RUN = re.compile(r"\$\{\{(?!\s*matrix\.[\w-]+\s*\}\})")
+# One value inside a flow mapping: a quoted string, or plain text up to the next ", key:".
+_FLOW_VALUE = (r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^']|'')*'"
+               r"|(?:(?!,\s*[\"']?[\w-]+[\"']?\s*:).)*)")
+# ``run:`` inside a flow mapping (``- {name: x, run: "echo ..."}``); RUN_KEY_RE only sees
+# block keys.
+FLOW_RUN_RE = re.compile(r"[{,]\s*[\"']?run[\"']?\s*:\s*" + _FLOW_VALUE)
+# The runner executes the ``shell:`` value as the command line, so no expression at all may
+# appear in it: block form (the rest of the line) and flow form.
+SHELL_BLOCK_RE = re.compile(r"^\s*(?:-\s+)?[\"']?shell[\"']?\s*:(.*)$")
+SHELL_FLOW_RE = re.compile(r"[{,]\s*[\"']?shell[\"']?\s*:\s*" + _FLOW_VALUE)
+# A YAML alias as the run value (``run: *script``) hides its text from the scan above.
+RUN_ALIAS_RE = re.compile(r"[\"']?\brun[\"']?\s*:\s*\*")
 WORKFLOW_FORBIDDEN = [
     ("id-token permission", re.compile(r"\bid-token\b")),
     ("actions/cache", re.compile(r"actions/cache\b")),
@@ -100,6 +112,16 @@ WORKFLOW_FORBIDDEN = [
     ("set -x", re.compile(
         r"\bset\s+-[a-wyz]*x|\bxtrace\b|\b(?:ba|da|z|k)?sh\s+(?:-\S+\s+)*-[a-wyz]*x")),
     ("--dump", re.compile(r"--dump\b")),
+    # rclone takes every flag from RCLONE_<FLAG> env vars too (RCLONE_DUMP=headers,auth is
+    # --dump), as an env: key or written to $GITHUB_ENV. Only the config file location and
+    # the secret that carries it are allowed.
+    ("RCLONE_* flag variable", re.compile(
+        r"\bRCLONE_(?!CONFIG(?:_B64)?\b)[A-Z0-9_]+[\"']?\s*[:=]")),
+    # A job container or service container pulls an arbitrary Docker image into the job,
+    # which the SHA-pinned-actions policy does not cover.
+    ("container/services", re.compile(r"^\s*[\"']?(container|services)[\"']?\s*:",
+                                      re.MULTILINE)),
+    ("container/services", re.compile(r"[{,]\s*[\"']?(container|services)[\"']?\s*:")),
     ("secrets: inherit", re.compile(r"\bsecrets\s*:\s*inherit\b")),
     # "contents: write", quoted forms, and flow mappings "{contents: write, ...}".
     ("write permission", re.compile(
@@ -300,10 +322,17 @@ def lint_workflow(path: str, text: str) -> list[str]:
 
     if not re.search(r"^permissions\s*:\s*\{\s*\}\s*$", body, re.MULTILINE):
         problems.append("top-level 'permissions: {}' missing")
-    for block in _run_blocks(raw):
-        if EXPR_IN_RUN.search(block):
-            problems.append("${{ }} expression inside run: (pass values through env:)")
-            break
+    # Raw lines again: a '#' inside a quoted flow value is still expanded by GitHub.
+    run_values = _run_blocks(raw) + [m.group(1) for line in raw
+                                     for m in FLOW_RUN_RE.finditer(line)]
+    if any(EXPR_IN_RUN.search(value) for value in run_values):
+        problems.append("${{ }} expression inside run: (pass values through env:)")
+    if any(RUN_ALIAS_RE.search(line) for line in lines):
+        problems.append("YAML alias as a run: value")
+    shell_values = [m.group(1) for line in raw
+                    for rx in (SHELL_BLOCK_RE, SHELL_FLOW_RE) for m in rx.finditer(line)]
+    if any("${{" in value for value in shell_values):
+        problems.append("${{ }} expression inside shell:")
     for name, rx in WORKFLOW_FORBIDDEN:
         if rx.search(body):
             problems.append(f"forbidden: {name}")

@@ -7,6 +7,7 @@ import csv
 import http.client
 import io
 import json
+import multiprocessing
 import re
 import sqlite3
 import threading
@@ -207,9 +208,22 @@ def test_post_rejections_do_not_mutate(c):
 
 
 def test_post_body_limit(c):
-    big = b'{"ids": [7], "reason": "' + b"x" * (site.MAX_BODY + 10) + b'"}'
-    code, data = c.post("/api/queue/add", raw=big)
-    assert code == 413 and data == {"error": "too_large"}
+    # The server refuses an oversized body from its Content-Length alone, without reading it,
+    # and closes the connection. Sending only the headers keeps the test free of the race
+    # where the client is still writing the body when the server hangs up (BrokenPipeError).
+    conn = http.client.HTTPConnection("127.0.0.1", c.port, timeout=10)
+    try:
+        conn.putrequest("POST", "/api/queue/add", skip_host=True, skip_accept_encoding=True)
+        for k, v in {"Host": c.host, "Content-Type": "application/json",
+                     "Origin": f"http://{c.host}", "X-CSRF-Token": c.token,
+                     "Content-Length": str(site.MAX_BODY + 10)}.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        resp = conn.getresponse()
+        assert resp.status == 413
+        assert json.loads(resp.read()) == {"error": "too_large"}
+    finally:
+        conn.close()
 
 
 def test_get_never_mutates_and_post_routes_need_post(c):
@@ -629,6 +643,83 @@ def test_safe_to_day_select(start):
     cl.post("/api/queue/add", {"ids": [16], "reason": "junk pick"})
     day16 = approved_days(cl)[ITEM[16]["local_date"]]
     assert day16["n_day_uncertain"] == 1 and day16["safe_to_day_select"] is False
+    # Every unsafe day says why; the clearer "not indexed" name carries the same count.
+    assert day10["n_not_indexed_that_day"] == 1
+    # (item 10 is from 2018, the year of the undated item 60.)
+    assert day10["day_select_blockers"] == ["not_indexed_that_day", "undated_in_year"]
+    assert day16["day_select_blockers"] == ["day_uncertain"]
+    assert days[d11]["day_select_blockers"] == ["not_all_approved"]
+    assert approved_days(cl)[ITEM[23]["local_date"]]["day_select_blockers"] == []
+
+
+def test_undated_photo_blocks_every_day_of_its_year(start):
+    """Item 60 has no date but sits in "Photos from 2018": Google Photos shows it somewhere
+    in 2018, so no 2018 day is provably complete (item 5 is the only photo of its day)."""
+    assert ITEM[60]["local_date"] is None and ITEM[60]["folder"] == "Photos from 2018"
+    assert ITEM[5]["local_date"].startswith("2018-") and ITEM[23]["year"] == 2021
+    cl = start()
+    cl.post("/api/queue/add", {"ids": [5, 23], "reason": "junk pick"})
+    days = approved_days(cl)
+    d5, d23 = days[ITEM[5]["local_date"]], days[ITEM[23]["local_date"]]
+    assert d5["n_approved_that_day"] == d5["n_indexed_photos_that_day"] == 1
+    assert d5["safe_to_day_select"] is False
+    assert d5["day_select_blockers"] == ["undated_in_year"] and d5["n_undated_in_year"] == 1
+    assert d23["safe_to_day_select"] is True and d23["n_undated_in_year"] == 0
+    s = cl.get_json("/api/stats")
+    assert s["undated_indexed"] == {"by_year": {"2018": 1}, "unknown_year": 0}
+
+
+def test_undated_photo_of_unknown_year_blocks_every_day(start):
+    # An album-only folder gives no year: the photo could be on any day.
+    cl = start(edit_sql=["UPDATE items SET folder = 'Trip', year = NULL WHERE item_id = 60"])
+    cl.post("/api/queue/add", {"ids": [23], "reason": "junk pick"})
+    d23 = approved_days(cl)[ITEM[23]["local_date"]]
+    assert d23["safe_to_day_select"] is False
+    assert d23["day_select_blockers"] == ["undated_unknown_year"]
+    assert d23["n_undated_in_year"] == 0 and d23["n_undated_unknown_year"] == 1
+    assert cl.get_json("/api/stats")["undated_indexed"]["unknown_year"] == 1
+
+
+def test_undated_year_column_wins_over_folder(start):
+    # The merge stores the folder year in ``year`` for undated photos; trust it when set.
+    cl = start(edit_sql=["UPDATE items SET year = 2021 WHERE item_id = 60"])
+    cl.post("/api/queue/add", {"ids": [5, 23], "reason": "junk pick"})
+    days = approved_days(cl)
+    assert days[ITEM[5]["local_date"]]["safe_to_day_select"] is True
+    assert days[ITEM[23]["local_date"]]["day_select_blockers"] == ["undated_in_year"]
+
+
+@pytest.mark.parametrize("key", ["unindexed_undated", "videos_undated"])
+def test_undated_unindexed_items_block_every_day(start, key):
+    """A video or skipped file with no date may be on any day in Google Photos."""
+    cl = start(edit_sql=[f"INSERT INTO stats VALUES ('{key}', '2')"])
+    cl.post("/api/queue/add", {"ids": [23], "reason": "junk pick"})
+    d23 = approved_days(cl)[ITEM[23]["local_date"]]
+    assert d23["safe_to_day_select"] is False
+    assert d23["day_select_blockers"] == ["unindexed_undated"]
+    assert d23["n_unindexed_undated"] == 2
+    assert cl.get_json("/api/stats")["not_indexed"]["undated"] == 2
+
+
+def test_unindexed_undated_zero_keeps_day_safe(start):
+    # The current key wins over the older one, so a stale videos_undated cannot block.
+    cl = start(edit_sql=["INSERT INTO stats VALUES ('unindexed_undated', '0')",
+                         "INSERT INTO stats VALUES ('videos_undated', '5')"])
+    cl.post("/api/queue/add", {"ids": [23], "reason": "junk pick"})
+    assert approved_days(cl)[ITEM[23]["local_date"]]["safe_to_day_select"] is True
+
+
+def test_stats_name_not_indexed_counts(c):
+    s = c.get_json("/api/stats")
+    # bundle_factory: 1 item on item 10's day + 3 on 2017-01-01 are not in the index.
+    assert s["bundle"]["videos"] == 4
+    assert s["not_indexed"] == {"on_a_day": 4, "undated": 0}
+
+
+def test_undated_day_group_has_no_blockers_list(c):
+    c.post("/api/queue/add", {"ids": [60], "reason": "junk pick"})
+    day = approved_days(c)[None]
+    assert day["safe_to_day_select"] is False and day["day_select_blockers"] == []
 
 
 # ---------------------------------------------------------------------------- duplicates
@@ -814,14 +905,14 @@ def test_favicon_is_quiet(c):
 def test_concurrent_approvals_cannot_take_whole_group(c):
     """Two parallel requests approving complementary halves of group 1 ([2, 3]): at most one
     may win (W-13's check and write are atomic)."""
-    review = c.server.app.review
-    original = review.user_add
+    app = c.server.app
+    original = app._check_approval
 
-    def slow_add(items):
+    def slow_check(items, override, conn=None):
         time.sleep(0.05)              # widen the check-to-write window a racing request needs
-        return original(items)
+        return original(items, override, conn)
 
-    review.user_add = slow_add
+    app._check_approval = slow_check
     for _round in range(3):
         barrier = threading.Barrier(2)
         codes: dict[int, int] = {}
@@ -917,3 +1008,67 @@ def test_static_text_matches_new_tab_behaviour():
     assert "reused tab" not in html and "Ctrl+W" in html
     assert "close that tab (Ctrl+W)" in js
     assert "S.marking" in js and "keeper_approved" in js
+
+
+# ---------------------------------------------------------------------------- two servers
+
+def _serve_worker(home: str, mode: str, item_id: int, barrier, results) -> None:
+    """Child process standing in for a second ``gpclean serve`` on the same home: its own
+    SiteApp (own bundle and review DB connections, own locks) approving one item."""
+    app = site.SiteApp(Path(home), 0)
+    original = app._check_approval
+
+    def slow_check(items, override, conn=None):
+        # Hold the check open long enough that the sibling process is surely trying to
+        # write too: without the in-transaction guard both would see the group incomplete.
+        time.sleep(0.3)
+        return original(items, override, conn)
+
+    app._check_approval = slow_check
+    try:
+        barrier.wait(60)
+        if mode == "add":
+            app.post_queue_add({"ids": [item_id], "reason": "junk pick"})
+        else:
+            app.post_queue_decide({"uids": [ITEM[item_id]["item_uid"]], "decision": "approve"})
+        results.put((item_id, "ok"))
+    except site.ApiError as exc:
+        results.put((item_id, exc.code))
+    finally:
+        app.close()
+
+
+@pytest.mark.parametrize("mode", ["add", "decide"])
+def test_two_server_processes_cannot_take_whole_group(tmp_path, mode):
+    """Two processes approving complementary halves of dup group 1 ([2, 3]) on one home:
+    the guard runs inside BEGIN IMMEDIATE, so exactly one of them wins."""
+    home = _write_home(tmp_path, make_bundle(tmp_path, n_items=N))
+    review = ReviewDB(home / "state" / "review.sqlite")
+    if mode == "decide":
+        review.propose([(uid(2), "looks like a copy", None), (uid(3), "looks like a copy", None)],
+                       proposer="claude:code", batch_id="b1")
+    ctx = multiprocessing.get_context("spawn")
+    barrier, results = ctx.Barrier(2), ctx.Queue()
+    procs = [ctx.Process(target=_serve_worker, args=(str(home), mode, i, barrier, results))
+             for i in (2, 3)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(120)
+    assert [p.exitcode for p in procs] == [0, 0]
+    got = dict(results.get(timeout=10) for _ in procs)
+    assert sorted(got.values()) == ["ok", "whole_group"], got
+    rows = review.get([uid(2), uid(3)])
+    assert sorted(r["status"] for r in rows.values()) == \
+        (["approved"] if mode == "add" else ["approved", "proposed"])
+    review.close()
+
+
+def test_static_page_explains_every_day_blocker():
+    """The page words every reason the server can give, and no longer calls the count of
+    items missing from the index "videos"."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    for code in site.DAY_BLOCKERS:
+        assert f"{code}:" in js, code
+    assert "day_select_blockers" in js and "n_not_indexed_that_day" in js
+    assert "not in the index" in js and '" videos \\u00b7 "' not in js

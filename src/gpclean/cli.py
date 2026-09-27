@@ -53,10 +53,11 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("--threshold", type=int, default=3, choices=(2, 3, 4, 5))
     s.add_argument("--clip-model", default="b32", choices=("b32", "b16", "none"))
     s.add_argument("--no-clip", action="store_true", help="same as --clip-model none")
-    s.add_argument("--workers", type=int, default=0, help="0 = number of CPUs")
+    s.add_argument("--workers", type=int, default=0, help="0 = automatic (CPUs; with CLIP at most 4 and one per 3 GB of RAM)")
     s.add_argument("--photos-per-shard", type=int, default=1000)
 
-    s = sub.add_parser("regroup", help="redo duplicate grouping/scores in a bundle (no Drive)")
+    s = sub.add_parser("regroup", help="redo duplicate grouping/scores in a bundle (no Drive); "
+                                       "stop 'gpclean serve'/'gpclean mcp' on this bundle first")
     s.add_argument("--bundle", type=Path, required=True)
     s.add_argument("--threshold", type=int, required=True, choices=(2, 3, 4, 5))
 

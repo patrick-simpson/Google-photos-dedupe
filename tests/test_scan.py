@@ -8,9 +8,12 @@ which is how "video and skipped member bytes are never read" is proven for the C
 from __future__ import annotations
 
 import dataclasses
+import gc
+import hashlib
 import io
 import multiprocessing
 import os
+import queue
 import random
 import re
 import shutil
@@ -21,7 +24,10 @@ import threading
 import time
 import types
 import urllib.parse
+import weakref
 import zipfile
+from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,7 +48,7 @@ PHOTOS = "Takeout/Google Photos/Photos from 2020/"
 CFG = ScanConfig(clip_model="none", photos_per_shard=1000)
 # shard_info values that legitimately differ between two scans of the same shard.
 VOLATILE_INFO = {"started", "finished", "bytes_read", "bytes_discarded", "pack_sha256",
-                 "pack_size"}
+                 "pack_md5", "pack_size"}
 
 
 # ------------------------------------------------------------------------------ helpers
@@ -312,7 +318,7 @@ def test_scan_shard_contents(fx, local_w1):
     assert int(si["bytes_read"]) > 0
     assert set(si) >= {"zipkey", "zip_name", "export_id", "shard", "code_version", "start",
                        "end", "n_sidecars", "n_skipped", "bytes_discarded", "pack_sha256",
-                       "pack_size", "started", "finished"}
+                       "pack_md5", "pack_size", "started", "finished"}
 
     by_idx = {e.member_idx: e for e in entries}
     for row in d["items_raw"]:
@@ -364,6 +370,16 @@ def test_spawn_pool_matches_in_process(fx, tmp_path, local_w1):
     assert pack_rows(pack) == ref_pack
     assert info["pack_sha256"] == scan._sha256_file(pack)
     assert not list(tmp_path.glob("*.part"))
+
+
+def test_shard_info_records_pack_md5_and_sha256(fx, tmp_path):
+    # pack_md5 lets the CI merge compare Drive's md5Checksum without downloading the pack.
+    info, meta, pack = run_shard(scan.LocalOpener(fx / ZIP1), fx / ZIP1, tmp_path, workers=1)
+    si = scan.read_shard_info(meta)
+    data = pack.read_bytes()
+    assert info["pack_md5"] == si["pack_md5"] == hashlib.md5(data).hexdigest()
+    assert info["pack_sha256"] == si["pack_sha256"] == hashlib.sha256(data).hexdigest()
+    assert int(si["pack_size"]) == len(data)
 
 
 def test_local_scan_never_opens_unwanted_members(fx, tmp_path, monkeypatch):
@@ -673,6 +689,115 @@ def test_stuck_worker_hits_deadline_and_is_killed(fx, tmp_path):
                                workers=2, embedder_name=name, pool=pool)
     assert info["n_items"] > 0
     assert time.monotonic() - t0 < 60
+
+
+# ------------------------------------------------------------ pool bookkeeping (no processes)
+
+
+class _FakeExecutor:
+    """Stands in for the ProcessPoolExecutor of a ScanPool; runs no process.
+
+    ``submit`` returns a Future that resolves to ``{"task": n, "blob": ...}`` (or raises
+    ``BrokenProcessPool`` for task numbers in ``die``), either at once or from a thread
+    (``threaded``) so ``as_completed`` also has to wait. Like the real executor, it drops
+    its own reference to a Future once the Future is resolved; ``refs`` keeps weak ones so
+    a test can check that nobody else holds on to a finished Future (and its result).
+    """
+
+    def __init__(self, *, threaded: bool = False, die=(), submit_limit: int | None = None):
+        self.refs: dict[int, weakref.ref] = {}
+        self.die, self.submit_limit = set(die), submit_limit
+        self.shut_down = False
+        self._queue: queue.SimpleQueue | None = None
+        if threaded:
+            self._queue = queue.SimpleQueue()
+            threading.Thread(target=self._serve, daemon=True).start()
+
+    def submit(self, fn, arg):
+        _opener, (task_no, _members) = arg
+        if self.submit_limit is not None and len(self.refs) >= self.submit_limit:
+            raise BrokenProcessPool("a process died")
+        fut = Future()
+        self.refs[task_no] = weakref.ref(fut)
+        if self._queue is None:
+            self._resolve(fut, task_no)
+        else:
+            self._queue.put((fut, task_no))
+        return fut
+
+    def _resolve(self, fut: Future, task_no: int) -> None:
+        if task_no in self.die:
+            fut.set_exception(BrokenProcessPool("a process died"))
+        else:
+            fut.set_result({"task": task_no, "blob": bytes(64 * 1024)})  # a thumbnail's worth
+
+    def _serve(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            fut, task_no = item
+            time.sleep(0.002)
+            self._resolve(fut, task_no)
+            del fut, item  # no reference left while blocked on the next get()
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        self.shut_down = True
+        if self._queue is not None:
+            self._queue.put(None)
+
+
+def _drain_checking_refs(pool: scan.ScanPool, fake: _FakeExecutor, n_tasks: int) -> list[dict]:
+    """Run ``n_tasks`` fake tasks through ``pool._run_pool``; after each result, assert that
+    the Futures of every result yielded so far are gone (so their results are not kept)."""
+    pool._executor = fake
+    tasks = [(n, []) for n in range(n_tasks)]
+    results = []
+    for res in pool._run_pool(scan.LocalOpener(Path("unused.zip")), tasks, None):
+        results.append(res)
+        gc.collect()
+        for got in results:
+            ref = fake.refs.get(got["task"])
+            assert ref is None or ref() is None, f"future of task {got['task']} still referenced"
+    return results
+
+
+@pytest.mark.parametrize("threaded", [False, True])
+def test_pool_drops_each_future_once_its_result_is_yielded(threaded):
+    fake = _FakeExecutor(threaded=threaded)
+    pool = scan.ScanPool(2, CFG, "stub")
+    try:
+        results = _drain_checking_refs(pool, fake, 40)
+        assert sorted(r["task"] for r in results) == list(range(40))
+        assert pool._executor is fake and not fake.shut_down  # kept for the next shard
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("die, submit_limit, isolated", [
+    ({3}, None, [3]),            # a task's process died: only that task is re-run
+    ((), 5, [5, 6, 7, 8, 9]),    # the pool broke while submitting: the rest is re-run
+])
+def test_broken_pool_reruns_exactly_the_unfinished_tasks(monkeypatch, die, submit_limit,
+                                                         isolated):
+    fake = _FakeExecutor(die=die, submit_limit=submit_limit)
+    pool = scan.ScanPool(2, CFG, "stub")
+    rerun = []
+
+    def fake_isolate(opener, left, deadline):
+        rerun.extend(sorted(t[0] for t in left))
+        for task_no, _members in left:
+            yield {"task": task_no, "isolated": True}
+
+    monkeypatch.setattr(pool, "_isolate", fake_isolate)
+    try:
+        results = _drain_checking_refs(pool, fake, 10)
+    finally:
+        pool.close()
+    assert sorted(r["task"] for r in results) == list(range(10))  # each exactly once
+    assert rerun == isolated
+    assert sorted(r["task"] for r in results if r.get("isolated")) == isolated
+    assert fake.shut_down and pool._executor is None  # the broken executor was dropped
 
 
 # --------------------------------------------------------------------------- pool reuse

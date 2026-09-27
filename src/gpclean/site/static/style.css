@@ -158,6 +158,8 @@ main { padding: 12px 16px 80px; outline: none; }
 .progress-row progress { flex: 1; max-width: 480px; height: 14px; }
 .note { padding: 6px 10px; border-left: 3px solid var(--warn); background: var(--warn-bg); }
 h3.day { margin: 18px 0 6px; font-size: 15px; }
+/* The "select one by one" badge lists every reason; let it wrap on narrow screens. */
+h3.day .badge { white-space: normal; }
 
 /* ---------------------------------------------------------------- cards */
 

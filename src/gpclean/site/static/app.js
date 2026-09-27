@@ -190,6 +190,10 @@
     const c = S.counts || {};
     const parts = [];
     if (b) parts.push(b.items + " photos", b.dup_groups.total + " duplicate groups");
+    // Library items the index has no row for (videos and skipped media such as raw files).
+    const ni = S.stats ? S.stats.not_indexed : null;
+    const nNotIndexed = ni ? (ni.on_a_day || 0) + (ni.undated || 0) : 0;
+    if (nNotIndexed) parts.push(nNotIndexed + " not in the index (videos, skipped files)");
     parts.push((c.proposed || 0) + " proposed", (c.approved || 0) + " approved",
       (c.deleted || 0) + " deleted");
     if (b && b.partial) parts.push("PARTIAL bundle (" + b.missing_shards + " shards missing)");
@@ -651,15 +655,21 @@
     out.push(el("div", { class: "toolbar" },
       el("button", { type: "button", class: "primary", onclick: () => openNext(S.openN) }, "Open next"), nInput,
       el("span", { class: "muted" }, "Per item: o opens it, press # in Google Photos, close that tab (Ctrl+W), then d here marks it deleted and moves on.")));
+    out.push(el("p", { class: "small muted" }, "\u201cSafe to day-select\u201d means selecting the whole day in Google Photos selects exactly the approved photos: " +
+      "every photo of that day is approved and nothing else can be on it (no videos or skipped files that day, no uncertain time zone, no undated items that could belong there)."));
     for (const day of d.days || []) {
+      // Videos AND skipped media of that day (the API's older name for it is videos_that_day).
+      const nNotIndexed = day.n_not_indexed_that_day;
       const head = el("h3", { class: "day" }, day.date || "No date / not in this bundle", " ",
         el("span", { class: "muted small" }, day.n_approved_that_day + " approved \u00b7 " + day.n_indexed_photos_that_day +
-          " photos indexed \u00b7 " + day.videos_that_day + " videos \u00b7 " + day.n_deleted_that_day + " deleted"));
+          " photos indexed \u00b7 " + nNotIndexed + " not in the index (videos, skipped files) \u00b7 " + day.n_deleted_that_day + " deleted"));
       if (day.safe_to_day_select) {
         head.append(" ", badge("safe to day-select (compare: " + day.n_approved_that_day + " selected)", "good"));
       } else if (day.date) {
-        const why = day.videos_that_day ? "videos that day" : day.n_day_uncertain ? "time zone uncertain" : "not every photo approved";
-        head.append(" ", badge("select one by one (" + why + ")", "muted"));
+        const why = dayBlockerText(day, nNotIndexed);
+        const b = badge("select one by one (" + why.join("; ") + ")", "muted");
+        b.title = "Not safe to select the whole day: " + why.join("; ");
+        head.append(" ", b);
       }
       out.push(head);
       out.push(el("div", { class: "grid" }, day.items.map((it) => card(it, {
@@ -668,6 +678,23 @@
     }
     if (!total) out.push(el("p", { class: "muted" }, "Nothing approved yet."));
     return out;
+  }
+
+  // Why a day is not "safe to day-select": the server's day_select_blockers codes in words.
+  const DAY_BLOCKER_TEXT = {
+    no_indexed_photos: () => "no reviewable photos that day",
+    not_all_approved: () => "not every photo approved",
+    not_indexed_that_day: (day, n) => n + " not in the index that day (videos, skipped files)",
+    day_uncertain: (day) => day.n_day_uncertain + " with an uncertain time zone",
+    undated_in_year: (day) => day.n_undated_in_year + " undated photos from " + day.date.slice(0, 4),
+    undated_unknown_year: (day) => day.n_undated_unknown_year + " undated photos of unknown year",
+    unindexed_undated: (day) => day.n_unindexed_undated + " undated videos / skipped files in the library",
+  };
+
+  function dayBlockerText(day, nNotIndexed) {
+    const codes = day.day_select_blockers || [];
+    const out = codes.map((code) => (DAY_BLOCKER_TEXT[code] ? DAY_BLOCKER_TEXT[code](day, nNotIndexed) : "unknown reason"));
+    return out.length ? out : ["unknown reason"];
   }
 
   function deletionControls(it, c) {

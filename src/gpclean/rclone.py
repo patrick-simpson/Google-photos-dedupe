@@ -8,6 +8,9 @@ Safety properties enforced here, before anything is executed:
 * Write verbs (copyto/copy/mkdir) must target the configured output root
   (default ``gp:gpclean-output``), so the Takeout export and the rest of Drive stay untouched
   even if a caller has a bug. (The OAuth scope ``drive.file`` is the third line of defence.)
+* rclone reads every flag from ``RCLONE_<FLAG>`` environment variables too (``RCLONE_DUMP``
+  is ``--dump``), so the child gets a copy of the environment without ``RCLONE_*`` variables
+  other than the config file location and password (see :func:`child_env`).
 * rclone output never reaches the console: stdout is captured, stderr and rclone's own log go
   to the private log file. Nothing here prints; messages carry the verb and exit code only.
 * A Drive download-limit/quota failure raises :class:`QuotaError`, so CI can stop cleanly
@@ -50,6 +53,10 @@ _DENIED_FLAG_PREFIXES = ("--dump", "--drive-acknowledge-abuse", "--rc", "--confi
 SERVE_HTTP_FLAGS = (
     "--addr", "127.0.0.1:0",
     "--read-only",
+    # No read-ahead: rclone's default 16M buffer reads past the end of every requested range
+    # and throws those bytes away when the reader closes the connection (+20-50% Drive
+    # egress measured). Readers stream sequentially behind their own buffer anyway.
+    "--buffer-size", "0",
     "--vfs-cache-mode", "off",
     "--vfs-read-chunk-size", "16M",
     "--vfs-read-chunk-size-limit", "64M",
@@ -64,6 +71,11 @@ SERVE_HTTP_FLAGS = (
 QUOTA_EXIT_CODES = frozenset({7, 8})
 _QUOTA_MARKERS = ("downloadQuotaExceeded", "quotaExceeded", "userRateLimitExceeded",
                   "download quota", "downloadLimitExceeded")
+
+# The only RCLONE_* variables handed to rclone: where the config file is and the password of
+# an encrypted one. Everything else (RCLONE_DUMP, RCLONE_LOG_LEVEL, RCLONE_RC,
+# RCLONE_PASSWORD_COMMAND, RCLONE_CONFIG_<REMOTE>_<OPTION>...) is dropped.
+_KEPT_RCLONE_ENV = frozenset({"RCLONE_CONFIG", "RCLONE_CONFIG_PASS"})
 
 _REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\- ]{0,63}")
 # rclone 1.75 logs "HTTP Server started on [http://127.0.0.1:PORT/]"; older ones "Serving on".
@@ -98,6 +110,15 @@ def _check_arg(value: str, what: str) -> str:
     if any(ch in value for ch in "\0\r\n"):
         raise ValueError(f"{what} contains control characters")
     return value
+
+
+def child_env() -> dict[str, str]:
+    """A copy of ``os.environ`` for the rclone child without flag-setting ``RCLONE_*`` vars.
+
+    Environment variable names are case-insensitive on Windows, hence ``upper()``.
+    """
+    return {key: value for key, value in os.environ.items()
+            if not key.upper().startswith("RCLONE_") or key.upper() in _KEPT_RCLONE_ENV}
 
 
 def _read_text_since(path: Path, offset: int) -> str:
@@ -229,6 +250,7 @@ class Rclone:
                 stdin=subprocess.DEVNULL,  # never block on an interactive prompt
                 stdout=stdout if stdout is not None else subprocess.PIPE,
                 stderr=log_fh if log_fh is not None else subprocess.PIPE,
+                env=child_env(),
                 timeout=timeout,
                 check=False,
             )
@@ -363,8 +385,8 @@ class Rclone:
         offset = log_file.stat().st_size if log_file.exists() else 0
         cmd = self._command("serve", ["http", path, *SERVE_HTTP_FLAGS], log_file)
         with open(log_file, "ab") as stderr:
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=stderr)
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=stderr, env=child_env())
         entry = (proc, log_file, offset)
         with self._serve_lock:
             self._serves.append(entry)

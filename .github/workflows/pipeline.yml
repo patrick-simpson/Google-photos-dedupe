@@ -7,7 +7,12 @@
 # - the only action is actions/checkout, pinned by SHA, with persist-credentials: false.
 # - the rclone config secret is decoded under umask 077 into $RUNNER_TEMP/rc and removed in
 #   an if: always() step. gpclean masks every token in it (ci-scope-check) before anything
-#   else runs, and fails closed unless the token has exactly drive.readonly + drive.file.
+#   else runs, and fails closed unless the token has exactly drive.readonly + drive.file:
+#   the log upload (the only later if: always() step that uses Drive) runs only when the
+#   scope check succeeded.
+# - every job that uses Drive runs only for refs/heads/main (besides the photos
+#   environment's branch policy), so a dispatch from another branch never gets the token;
+#   the report then turns the run red (docs/PLAN.md §9).
 # - the public console gets numbers only: every gpclean step runs as
 #   `python -m gpclean <cmd> 3>&1 1>>private/run.log 2>&1`, and only publiclog writes to fd 3.
 # - no caches, no artifacts, no secrets: inherit, no write permissions, static run-name.
@@ -71,7 +76,7 @@ env:
 
 jobs:
   probe:
-    if: ${{ inputs.mode == 'probe' }}
+    if: ${{ github.ref == 'refs/heads/main' && inputs.mode == 'probe' }}
     runs-on: ubuntu-24.04
     environment: photos
     permissions:
@@ -101,18 +106,19 @@ jobs:
           chmod 600 "$RUNNER_TEMP/rc/rclone.conf"
           echo "RCLONE_CONFIG=$RUNNER_TEMP/rc/rclone.conf" >> "$GITHUB_ENV"
       - name: scope check
+        id: scope
         run: .venv/bin/python -m gpclean ci-scope-check 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
       - name: probe
         run: .venv/bin/python -m gpclean probe 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
       - name: upload private logs
-        if: always()
+        if: ${{ always() && steps.scope.outcome == 'success' }}
         run: .venv/bin/python -m gpclean ci-upload-logs 3>/dev/null 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1 || true
       - name: remove drive credentials
         if: always()
         run: rm -rf "$RUNNER_TEMP/rc"
 
   plan:
-    if: ${{ inputs.mode != 'probe' }}
+    if: ${{ github.ref == 'refs/heads/main' && inputs.mode != 'probe' }}
     runs-on: ubuntu-24.04
     environment: photos
     permissions:
@@ -149,6 +155,7 @@ jobs:
           chmod 600 "$RUNNER_TEMP/rc/rclone.conf"
           echo "RCLONE_CONFIG=$RUNNER_TEMP/rc/rclone.conf" >> "$GITHUB_ENV"
       - name: scope check
+        id: scope
         run: .venv/bin/python -m gpclean ci-scope-check 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
       - name: upload selftest fixtures
         if: ${{ inputs.mode == 'selftest' }}
@@ -157,7 +164,7 @@ jobs:
         id: plan
         run: .venv/bin/python -m gpclean ci-plan 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
       - name: upload private logs
-        if: always()
+        if: ${{ always() && steps.scope.outcome == 'success' }}
         run: .venv/bin/python -m gpclean ci-upload-logs 3>/dev/null 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1 || true
       - name: remove drive credentials
         if: always()
@@ -240,12 +247,13 @@ jobs:
           chmod 600 "$RUNNER_TEMP/rc/rclone.conf"
           echo "RCLONE_CONFIG=$RUNNER_TEMP/rc/rclone.conf" >> "$GITHUB_ENV"
       - name: scope check
+        id: scope
         run: .venv/bin/python -m gpclean ci-scope-check 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
       - name: merge
         id: merge
         run: .venv/bin/python -m gpclean ci-merge 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
       - name: upload private logs
-        if: always()
+        if: ${{ always() && steps.scope.outcome == 'success' }}
         run: .venv/bin/python -m gpclean ci-upload-logs 3>/dev/null 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1 || true
       - name: remove drive credentials
         if: always()
@@ -253,10 +261,11 @@ jobs:
 
   # No Drive access and no secrets: turns the run red when the bundle is partial, the plan
   # skipped unreadable zips, or a job stopped on a Drive quota (then it prints the UTC hour
-  # the quota resets).
+  # the quota resets). It also runs for a probe dispatched from a branch other than main, so
+  # that mistake shows as a red run (plan is skipped) instead of an all-skipped green one.
   report:
     needs: [plan, pass1, pass2, pass3, merge]
-    if: ${{ !cancelled() && inputs.mode != 'probe' }}
+    if: ${{ !cancelled() && (inputs.mode != 'probe' || github.ref != 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read

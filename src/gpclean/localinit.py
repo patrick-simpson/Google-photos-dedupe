@@ -133,6 +133,12 @@ def current_bundle(home: Path) -> Path:
 
 _HASH_CHUNK = 1024 * 1024
 
+# How a user updates the app on the PC (docs/SETUP_WINDOWS.md, "Updating the app"): the setup
+# script does git pull, the pinned uv and uv sync when run again.
+UPDATE_APP_HINT = ("Update the app: run powershell -ExecutionPolicy Bypass -File "
+                   "C:\\gpclean\\app\\tools\\setup-windows.ps1 (then restart the review site "
+                   "and Claude), or download a newer bundle.")
+
 
 @dataclass
 class BundleCheck:
@@ -247,7 +253,7 @@ def check_index_schema(bundle: Path) -> str | None:
     found = row[0] if row else None
     if str(found) != str(INDEX_SCHEMA):
         return (f"index.sqlite has schema version {found}, but this version of gpclean needs "
-                f"{INDEX_SCHEMA}. Update the app (git pull) or download a newer bundle.")
+                f"{INDEX_SCHEMA}. {UPDATE_APP_HINT}")
     return None
 
 
@@ -376,7 +382,7 @@ def gpclean_executable(python: str | None = None, *, windows: bool | None = None
         # Handle a Windows path even when called on another OS (tests).
         folder = python.replace("/", "\\").rsplit("\\", 1)[0]
         return folder + "\\gpclean.exe"
-    return str(Path(python).parent / "gpclean")
+    return str(PurePosixPath(python).parent / "gpclean")  # POSIX layout even when run on Windows
 
 
 def _ps_quote(s: str) -> str:
@@ -420,13 +426,17 @@ def cli_mcp_config(home) -> int:
     _say("only switched on there, together with its safety settings.")
     _say("")
     _say("=== 2) Claude Desktop ===")
-    _say("In Claude Desktop open Settings > Developer > Edit Config, open the file it shows")
+    _say("In Claude Desktop open Settings > Developer > Edit Config (Developer is in the")
+    _say("'Desktop app' part of the Settings list), and open the file it shows")
     _say("(claude_desktop_config.json) in Notepad. If the file is empty or only {}, replace")
     _say("everything with this block. If the file already has an \"mcpServers\" section, add only")
     _say('the "gpclean": {...} part inside it. If the file has other settings but no')
     _say('"mcpServers", put your cursor right after the very first {, paste only the')
     _say('"mcpServers": { ... } part, and type a comma after its closing }.')
     _say("Save, then fully quit Claude Desktop (tray icon > Quit) and start it again.")
+    _say("Check: in a new chat, click the + button at the bottom left of the message box >")
+    _say("Connectors (older versions: the slider icon 'Search and tools'). gpclean should be")
+    _say("listed and switched on.")
     _say("")
     _say(desktop)
     _say("")

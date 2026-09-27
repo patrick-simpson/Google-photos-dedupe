@@ -21,6 +21,14 @@ Concurrency: the DB is in WAL mode with a busy timeout, the connection is in aut
 the write lock up front matters in WAL: a deferred transaction that reads and then tries to
 write can fail at once with SQLITE_BUSY_SNAPSHOT instead of waiting for the busy timeout.
 
+Cross-process checks: ``user_add`` and ``decide`` take an optional ``guard(conn)`` callable
+that runs inside the write transaction, after ``BEGIN IMMEDIATE`` has taken the database write
+lock and before anything is written. A rule that depends on the current queue (the site's "never
+approve every member of a duplicate group") can therefore re-read the queue through ``conn`` and
+be sure no other process changes it until the commit; raising from the guard rolls the
+transaction back and the exception propagates to the caller unchanged. A guard must only read:
+it runs again if the write is retried after SQLITE_BUSY.
+
 Every write appends rows to ``events`` (the audit log). The ``state.rev`` counter is bumped
 by triggers in ``schema.REVIEW_DDL`` on every change to ``queue`` or ``group_decisions``, so
 the site can poll it cheaply.
@@ -79,6 +87,10 @@ _UNSAFE_RE = re.compile(
 _SPACE_RE = re.compile(r"[\t\n\v\f\r ]+")
 
 T = TypeVar("T")
+
+# A pre-write check run inside the write transaction (see the module docstring). It receives
+# the connection, must only read, and raises to refuse the write.
+Guard = Callable[[sqlite3.Connection], None]
 
 
 def strip_unsafe(text: str) -> str:
@@ -254,7 +266,33 @@ class ReviewDB:
                 out[row["item_uid"]] = row
         return out
 
+    @staticmethod
+    def _run_guard(guard: Guard | None, conn: sqlite3.Connection) -> None:
+        """Call ``guard(conn)`` (if any) inside the open write transaction, before writing."""
+        if guard is None:
+            return
+        if not callable(guard):
+            raise TypeError("guard must be callable")
+        guard(conn)
+
     # ------------------------------------------------------------------ reads
+
+    def approved_among(self, uids: Iterable[str],
+                       conn: sqlite3.Connection | None = None) -> set[str]:
+        """The subset of ``uids`` whose queue status is ``'approved'`` (deleted or not).
+
+        Pass the ``conn`` a guard received to read inside that write transaction; without it
+        the read uses this object's own connection.
+        """
+        uids = _check_uids(uids)
+        out: set[str] = set()
+        for part in _chunks(uids):
+            sql = (f"SELECT item_uid FROM queue WHERE status = 'approved'"
+                   f" AND item_uid IN ({','.join('?' * len(part))})")
+            rows = conn.execute(sql, part).fetchall() if conn is not None \
+                else self._read(sql, part)
+            out.update(r[0] for r in rows)
+        return out
 
     def rev(self) -> int:
         """Change counter; bumped on every queue / group-decision change."""
@@ -410,17 +448,22 @@ class ReviewDB:
 
     # ------------------------------------------------------------------ user writes
 
-    def user_add(self, items: list[tuple[str, str, str | None]]) -> int:
+    def user_add(self, items: list[tuple[str, str, str | None]], *,
+                 guard: Guard | None = None) -> int:
         """The user queues items directly: they become (or stay) ``'approved'``.
 
         New rows get ``proposed_by='user'``. An existing proposed or rejected row is upgraded
         to approved (the user's latest action wins) but keeps its original proposer and reason,
         so the audit trail still shows who suggested it and why. Returns rows inserted or
         changed.
+
+        ``guard(conn)``, when given, runs inside the write transaction before any row is
+        written; whatever it raises rolls the call back and propagates.
         """
         clean = [(_check_uid(u), sanitise_reason(r), _check_category(c)) for u, r, c in items]
 
         def run(conn: sqlite3.Connection, now: str) -> int:
+            self._run_guard(guard, conn)
             n = 0
             existing = self._status_of(conn, list(dict.fromkeys(u for u, _, _ in clean)))
             for uid, reason, category in clean:
@@ -447,19 +490,23 @@ class ReviewDB:
 
         return self._write(run)
 
-    def decide(self, uids: list[str], decision: str) -> int:
+    def decide(self, uids: list[str], decision: str, *, guard: Guard | None = None) -> int:
         """User decision on existing rows: approve | reject | reset. Returns rows changed.
 
         ``reset`` undoes a decision: Claude's rows go back to ``'proposed'``; rows the user
         added are deleted (there is nothing to go back to). Rows already marked deleted are
         skipped; unmark them with ``mark_deleted(..., False)`` first, so the record of what
         was deleted in Google Photos is never lost by a stray keypress.
+
+        ``guard(conn)``, when given, runs inside the write transaction before any row is
+        written; whatever it raises rolls the call back and propagates.
         """
         if decision not in DECISIONS:
             raise ValueError("decision must be approve, reject or reset")
         uids = _check_uids(uids)
 
         def run(conn: sqlite3.Connection, now: str) -> int:
+            self._run_guard(guard, conn)
             n = 0
             rows = self._status_of(conn, uids)
             for uid in uids:

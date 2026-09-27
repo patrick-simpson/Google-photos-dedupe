@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from gpclean.rclone import (ALLOWED_VERBS, DENIED_VERBS, SERVE_HTTP_FLAGS, QuotaError, Rclone,
-                            RcloneDenied, RcloneError)
+                            RcloneDenied, RcloneError, child_env)
 
 POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="fake server process needs POSIX")
 
@@ -39,6 +39,8 @@ if args and args[0] == "serve" and not os.environ.get("FAKE_RCLONE_RC"):
     with open(log, "a", encoding="utf-8") as fh:
         fh.write("NOTICE: dir: HTTP Server started on [http://127.0.0.1:%d/]\n" % srv.server_port)
     srv.serve_forever()
+if os.environ.get("FAKE_RCLONE_PRINT_ENV"):
+    sys.stdout.write(" ".join(sorted(k for k in os.environ if k.upper().startswith("RCLONE_"))))
 sys.stdout.write(os.environ.get("FAKE_RCLONE_STDOUT", ""))
 sys.exit(int(os.environ.get("FAKE_RCLONE_RC", "0")))
 '''
@@ -61,8 +63,8 @@ def make_fake_rclone(directory: Path) -> str:
 @pytest.fixture
 def fake(tmp_path, monkeypatch):
     """(Rclone using the fake binary, function returning recorded argv lists)."""
-    for var in ("FAKE_RCLONE_RC", "FAKE_RCLONE_LOG", "FAKE_RCLONE_STDOUT", "GPCLEAN_PRIVATE_DIR",
-                "GPCLEAN_REMOTE", "GPCLEAN_OUT_ROOT"):
+    for var in ("FAKE_RCLONE_RC", "FAKE_RCLONE_LOG", "FAKE_RCLONE_STDOUT", "FAKE_RCLONE_PRINT_ENV",
+                "GPCLEAN_PRIVATE_DIR", "GPCLEAN_REMOTE", "GPCLEAN_OUT_ROOT"):
         monkeypatch.delenv(var, raising=False)
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -327,6 +329,29 @@ def test_access_token_needs_config():
 
 
 # ----- serve http -----------------------------------------------------------------------------
+
+def test_rclone_env_vars_are_not_passed_to_child(fake, monkeypatch, tmp_path):
+    # RCLONE_DUMP=headers is the env form of --dump; it must never reach rclone. The config
+    # file location (and an encrypted config's password) still does.
+    rc, _calls = fake
+    monkeypatch.setenv("RCLONE_DUMP", "headers,auth")
+    monkeypatch.setenv("RCLONE_LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("RCLONE_CONFIG", str(tmp_path / "rc" / "rclone.conf"))
+    monkeypatch.setenv("RCLONE_CONFIG_PASS", "x")
+    env = child_env()
+    assert "RCLONE_DUMP" not in env and "RCLONE_LOG_LEVEL" not in env
+    assert env["RCLONE_CONFIG"] == str(tmp_path / "rc" / "rclone.conf")
+    assert "RCLONE_CONFIG_PASS" in env and "FAKE_RCLONE_RECORD" in env
+    # ...and the child really gets that environment (the fake prints its RCLONE_* names).
+    monkeypatch.setenv("FAKE_RCLONE_PRINT_ENV", "1")
+    assert rc.version() == "RCLONE_CONFIG RCLONE_CONFIG_PASS"
+
+
+def test_serve_http_flags_disable_read_ahead():
+    # rclone's default 16M --buffer-size reads past every requested range (wasted egress).
+    flags = list(SERVE_HTTP_FLAGS)
+    assert flags[flags.index("--buffer-size") + 1] == "0"
+
 
 @POSIX_ONLY
 def test_serve_http_fake(fake, tmp_path):

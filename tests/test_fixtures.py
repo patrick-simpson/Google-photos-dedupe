@@ -16,7 +16,6 @@ import struct
 import time
 import zipfile
 from datetime import datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pillow_heif
@@ -345,6 +344,52 @@ def test_video_days_follow_sidecars_in_new_york_time(fx):
     assert days == e["videos"]["by_day"]
     # The planted time-zone traps: a UTC-named Pixel video and the DST-change night.
     assert "2022-07-03" in days and "2023-03-11" in days
+
+
+# Skip reasons whose year-folder files are library items without an index row (mirrors
+# gpclean.merge.load.UNINDEXED_SKIP_REASONS, restated so this check stays independent).
+_UNINDEXED_SKIPS = ("raw", "other_image", "too_large")
+
+
+def test_unindexed_by_day_counts_videos_and_skipped_media_per_url(fx):
+    """Re-derive ``unindexed_by_day`` from the zip bytes: every year-folder video, plus every
+    year-folder raw / other-format / oversized skip whose own sidecar (same folder, title =
+    file name) exists, once per url, on its New York day."""
+    e = fx["expected"]
+    media = list(e["videos"]["members"])
+    media += [r for r, why in e["skipped"].items()
+              if why in _UNINDEXED_SKIPS and "/Photos from " in r]
+    days: dict[str, int] = {}
+    urls: set[str] = set()
+    for ref in media:
+        zip_name, member = _split(ref)
+        folder, fname = member.rsplit("/", 1)
+        doc = json.loads(fx["zips"][zip_name].read(f"{folder}/{sidecar_name(fname)}"))
+        assert doc["title"] == fname
+        if doc["url"] in urls:
+            continue
+        urls.add(doc["url"])
+        day = datetime.fromtimestamp(int(doc["photoTakenTime"]["timestamp"]), NY).date()
+        days[day.isoformat()] = days.get(day.isoformat(), 0) + 1
+    assert days == e["unindexed_by_day"]
+    assert list(e["unindexed_by_day"]) == sorted(e["unindexed_by_day"])
+    # Videos are a part of it; the planted .dng (2023) and .tif (2018) add the rest.
+    for day, n in e["videos"]["by_day"].items():
+        assert e["unindexed_by_day"][day] >= n
+    extra = sum(e["unindexed_by_day"].values()) - sum(e["videos"]["by_day"].values())
+    assert extra == 2 and "2018-03-03" in e["unindexed_by_day"]
+
+
+def test_unindexed_by_day_is_the_same_without_albums(fx):
+    e = fx["expected"]
+    v = expected_view(e, include_albums=False)
+    assert v["unindexed_by_day"] == e["unindexed_by_day"] and v["videos"] == e["videos"]
+
+
+def test_expected_json_on_disk_has_unindexed_by_day(fx):
+    on_disk = json.loads((fx["out"] / "expected.json").read_text(encoding="utf-8"))
+    assert on_disk["unindexed_by_day"] == fx["expected"]["unindexed_by_day"]
+    assert all(type(n) is int and n > 0 for n in on_disk["unindexed_by_day"].values())
 
 
 def test_motion_photo_is_jpeg_followed_by_mp4(fx):

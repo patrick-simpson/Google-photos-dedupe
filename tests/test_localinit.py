@@ -207,7 +207,10 @@ def test_verify_rejects_unsafe_manifest_paths(bundle, tmp_path):
 def test_verify_wrong_schema_version(bundle, monkeypatch, capsys):
     monkeypatch.setattr("gpclean.version.INDEX_SCHEMA", 999)
     assert cli_verify_bundle(bundle) == 1
-    assert "schema version" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "schema version" in out
+    # The fix is a command the docs give, not "git pull".
+    assert r"C:\gpclean\app\tools\setup-windows.ps1" in out and "git pull" not in out
 
 
 def test_verify_missing_manifest(tmp_path):
@@ -257,6 +260,7 @@ def test_cli_mcp_config_prints_valid_json(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "claude mcp add gpclean --scope local -e HF_HUB_OFFLINE=1 -- " in out
     assert "Settings > Developer > Edit Config" in out
+    assert "+ button" in out and "Connectors" in out
     block = out[out.index('{\n  "mcpServers"'):]
     block = block[:block.index("\n}\n") + 2]
     data = json.loads(block)
@@ -286,8 +290,34 @@ def test_setup_pins_rclone_version():
     assert "Rclone.Rclone" in text
     assert re.search(r"--version\s+\$RcloneVersion", text)
     assert '$RcloneVersion = "1.75.1"' in text
-    assert "uv sync --locked --group clip --group mcp" in text
+    assert "$Uv sync --locked --group clip --group mcp" in text
     assert "https://github.com/patrick-simpson/Google-photos-dedupe" in text
+
+
+def test_setup_installs_the_hash_pinned_uv_not_winget():
+    """A uv outside 0.8.x would fetch an unhashed uv-build from PyPI (pyproject's
+    uv_build<0.9), so the PC must use tools/install_uv.ps1, like CI."""
+    text = _script("setup-windows.ps1")
+    assert "astral-sh.uv\" -Command" not in text          # no Install-WithWinget for uv
+    assert not re.search(r"winget\s+install[^\n]*astral-sh\.uv", text)
+    assert "tools\\install_uv.ps1" in text and "-Dest $BinDir" in text
+    pinned = re.search(r"\$UvVersion = '([\d.]+)'", _script("install_uv.ps1")).group(1)
+    assert f'$UvVersion = "{pinned}"' in text             # same pin as install_uv.ps1
+    assert pinned.startswith("0.8.")
+    # Every uv call in the setup uses the pinned binary, never whatever "uv" is on PATH.
+    code = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    assert not [ln for ln in code if re.search(r"\{\s*uv\s", ln)]
+    assert "Add-ToUserPath $BinDir" in text
+
+
+def test_setup_makes_home_private_and_refuses_arm():
+    text = _script("setup-windows.ps1")
+    # icacls by SID (works on non-English Windows): the user, SYSTEM, Administrators only.
+    assert "/inheritance:r" in text
+    for sid in ("*${sid}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"):
+        assert sid in text
+    assert text.index("Protect-Folder $Home0") < text.index("git clone $RepoUrl")
+    assert "PROCESSOR_ARCHITEW6432" in text and '$arch -ne "AMD64"' in text
 
 
 def test_get_bundle_copies_never_syncs():
@@ -297,11 +327,40 @@ def test_get_bundle_copies_never_syncs():
     assert r"C:\gpclean\ci-rclone.conf" in text
 
 
+def test_get_bundle_downloads_only_manifest_files_and_skips_selftests():
+    text = _script("get-bundle.ps1")
+    # Only what the manifest lists (no stale thumb packs), the manifest itself last.
+    copies = re.findall(r"& rclone copy [^\n]*", text)
+    assert copies and all("--files-from $listFile" in c for c in copies)
+    assert text.index("manifest.json.part") < text.index("--files-from $listFile")
+    assert text.index("--files-from $listFile") < text.index(
+        'Move-Item -LiteralPath $manifestPart')
+    # A path from the Drive manifest must stay inside the new folder.
+    assert r"'(^|/)\.\.?(/|$)'" in text
+    # Selftest bundles: marked in the manifest, or their shards.json lists a selftest zip.
+    assert '$Manifest.mode -eq "selftest"' in text
+    assert "$Root/state/$Name/shards.json" in text and "$Root/selftest" in text
+    assert "if ($isSelftest -and -not $Cfg)" in text
+    # "$name:" inside a PowerShell string is a scope-qualified variable, not text.
+    assert not re.search(r'"[^"\n]*\$(candidate|name|chosen):', text)
+
+
 def test_refresh_secret_script():
     text = _script("refresh-secret.ps1")
     assert "config reconnect gp:" in text
     assert "gh secret set RCLONE_CONFIG_B64 --env photos" in text
     assert "probe" in text
+
+
+def test_refresh_secret_checks_the_token_really_changed():
+    """rclone exits 0 when "replace it?" is answered n, so the script compares the token."""
+    text = _script("refresh-secret.ps1")
+    assert "Token already configured - replace it?" in text
+    assert text.index("$before = ") < text.index("config reconnect gp:") < text.index("$after = ")
+    assert "($after -ne $before)" in text and "NOT renewed" in text
+    assert text.index("if (-not $renewed)") < text.index("gh secret set")
+    # The token lines are never written anywhere.
+    assert not re.search(r"Write-(Host|Output)[^\n]*\$(before|after)", text)
 
 
 def test_scripts_pass_repo_hygiene_checks():
@@ -345,8 +404,12 @@ def test_docs_trash_is_30_days(rel):
 def test_readme_cleanup_order_and_trash():
     text = (REPO / "README.md").read_text(encoding="utf-8")
     assert "30 days" in text
-    # (e) the offline copy decision comes before (c) the irreversible Storage saver step.
-    assert text.index("(e)") < text.index("(c)")
+    # Numbered in the order to follow: the offline copy (Step 3) comes before the
+    # irreversible Storage saver conversion (Step 4).
+    steps = [text.index(f"**Step {n}.") for n in range(1, 6)]
+    assert steps == sorted(steps)
+    assert text.index("offline copy") < text.index("Storage saver")
+    assert not re.search(r"\*\*\([a-e]\)", text)
     for link in ("docs/SETUP_WINDOWS.md", "docs/MCP_GUIDE.md", "docs/GITHUB_SETTINGS.md"):
         assert link in text
 
@@ -357,3 +420,35 @@ def test_mcp_guide_examples():
     assert "show me blurry photos from 2019 and queue the ones that are clearly accidental" in text
     examples = re.findall(r'^\s*\d+\.\s+"', text, re.M)
     assert len(examples) >= 12
+
+
+def test_docs_name_the_project_chat_and_cover_updates():
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    setup = (REPO / "docs/SETUP_WINDOWS.md").read_text(encoding="utf-8")
+    assert "## Two Claudes" in readme and "https://claude.ai/code" in readme
+    assert "project chat" in setup
+    # Every "tell Claude" in the setup guide says which chat (or the guide's glossary does).
+    for m in re.finditer(r"[Tt]ell Claude", setup):
+        window = setup[m.start():m.start() + 60]
+        assert "project chat" in window or "**Tell Claude**" in setup[m.start() - 2:m.end() + 2], window
+    assert "## Updating the app (when Claude asks you to)" in setup
+    assert r"C:\gpclean\app\tools\setup-windows.ps1" in setup
+    assert "-Cfg" in setup
+    assert "Token already configured - replace it?" in setup
+    assert "'Tls12'" in setup and "Paste anyway" in setup
+    assert "not ARM" in setup and "not ARM" in readme
+
+
+def test_docs_never_install_uv_from_winget():
+    for rel in DOCS + ["docs/PLAN.md"]:
+        text = (REPO / rel).read_text(encoding="utf-8")
+        assert not re.search(r"winget install[^\n`]*astral-sh\.uv", text), rel
+
+
+def test_mcp_guide_uses_current_desktop_menu_names():
+    text = (REPO / "docs/MCP_GUIDE.md").read_text(encoding="utf-8")
+    assert "**Connectors**" in text and "**+**" in text
+    assert "under **Desktop app**, click **Developer**" in text
+    # "Search and tools" survives only as the older name.
+    for m in re.finditer(r"Search and tools", text):
+        assert "older versions" in text[max(0, m.start() - 60):m.start()].lower()

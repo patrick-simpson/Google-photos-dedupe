@@ -8,6 +8,7 @@ skips itself unless ``GPCLEAN_TEST_CLIP=1`` is set, per docs/INTERFACES.md.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -280,6 +281,194 @@ def test_fetch_model_redownloads_after_local_corruption(tmp_path, monkeypatch):
 
     path = fetch_model("b32")
     assert path.read_bytes() == payload
+
+
+# --- "already verified" sidecar marker -------------------------------------------------------
+
+
+def _count_hashes(monkeypatch) -> list[Path]:
+    """Wrap ``_sha256_of`` so a test can see how many full hashes a call performed."""
+    calls: list[Path] = []
+    real = clipmodel._sha256_of
+
+    def counting(path):
+        calls.append(Path(path))
+        return real(path)
+
+    monkeypatch.setattr(clipmodel, "_sha256_of", counting)
+    return calls
+
+
+def _no_download(url, dest, *, timeout=60.0):
+    raise AssertionError("should not download")
+
+
+def _cached_file(payload: bytes) -> Path:
+    """Write ``payload`` at the (monkeypatched) b32 cache path, with no marker yet."""
+    dest = clipmodel._cache_path(MODELS["b32"])
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(payload)
+    return dest
+
+
+def test_download_writes_marker_and_is_fully_hashed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    payload = b"fresh-download"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setitem(MODELS, "b32", _fake_spec(digest))
+    monkeypatch.setattr(
+        clipmodel, "_download", lambda url, dest, *, timeout=60.0: Path(dest).write_bytes(payload)
+    )
+    hashes = _count_hashes(monkeypatch)
+
+    path = fetch_model("b32")
+
+    assert len(hashes) == 1  # the download itself is always hashed
+    marker = json.loads(clipmodel._marker_path(path).read_text(encoding="utf-8"))
+    st = path.stat()
+    assert marker == {"sha256": digest, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    # No temp files left behind (neither the download's nor the marker's).
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name, f"{path.name}.verified"]
+
+
+def test_matching_marker_skips_rehash(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    payload = b"cached-bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setitem(MODELS, "b32", _fake_spec(digest))
+    monkeypatch.setattr(clipmodel, "_download", _no_download)
+    dest = _cached_file(payload)
+    hashes = _count_hashes(monkeypatch)
+
+    fetch_model("b32")  # no marker yet: full hash, then writes one
+    assert len(hashes) == 1
+    assert clipmodel._marker_path(dest).exists()
+
+    assert fetch_model("b32") == dest  # marker matches: trusted, no hash
+    assert fetch_model("b32", download=False) == dest
+    assert len(hashes) == 1
+
+
+def test_marker_ignored_when_mtime_changes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    payload = b"cached-bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setitem(MODELS, "b32", _fake_spec(digest))
+    monkeypatch.setattr(clipmodel, "_download", _no_download)
+    dest = _cached_file(payload)
+    fetch_model("b32")
+
+    st = dest.stat()
+    os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # "touched"
+    hashes = _count_hashes(monkeypatch)
+
+    assert fetch_model("b32") == dest
+    assert len(hashes) == 1  # re-hashed because mtime_ns no longer matches
+    marker = json.loads(clipmodel._marker_path(dest).read_text(encoding="utf-8"))
+    assert marker["mtime_ns"] == dest.stat().st_mtime_ns  # marker refreshed
+
+
+def test_marker_ignored_when_content_replaced(tmp_path, monkeypatch):
+    """Same-size corruption with a new mtime must be caught (re-hash -> mismatch -> refetch),
+    and the stale marker must go away with the bad file."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    payload = b"the-real-bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setitem(MODELS, "b32", _fake_spec(digest))
+    monkeypatch.setattr(clipmodel, "_download", _no_download)
+    dest = _cached_file(payload)
+    fetch_model("b32")
+
+    st = dest.stat()
+    dest.write_bytes(b"X" * len(payload))  # same size, different bytes
+    os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+    with pytest.raises(FileNotFoundError):
+        fetch_model("b32", download=False)
+    assert not dest.exists()
+    assert not clipmodel._marker_path(dest).exists()
+
+
+@pytest.mark.parametrize(
+    "marker_text",
+    [
+        "not json at all",
+        "[1, 2, 3]",
+        json.dumps({"sha256": "0" * 64, "size": 0, "mtime_ns": 0}),
+    ],
+    ids=["garbage", "not-a-dict", "wrong-values"],
+)
+def test_bad_marker_falls_back_to_rehash(tmp_path, monkeypatch, marker_text):
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    payload = b"cached-bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setitem(MODELS, "b32", _fake_spec(digest))
+    monkeypatch.setattr(clipmodel, "_download", _no_download)
+    dest = _cached_file(payload)
+    clipmodel._marker_path(dest).write_text(marker_text, encoding="utf-8")
+    hashes = _count_hashes(monkeypatch)
+
+    assert fetch_model("b32") == dest
+    assert len(hashes) == 1
+
+
+def test_marker_for_other_pin_is_not_trusted(tmp_path, monkeypatch):
+    """A marker vouching for a different sha256 (e.g. the pin was bumped) must not be trusted,
+    even if size and mtime match the file on disk."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    payload = b"old-pinned-bytes"
+    monkeypatch.setitem(MODELS, "b32", _fake_spec("0" * 64))  # new pin these bytes don't match
+    monkeypatch.setattr(clipmodel, "_download", _no_download)
+    dest = _cached_file(payload)
+    st = dest.stat()
+    clipmodel._marker_path(dest).write_text(
+        json.dumps(
+            {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileNotFoundError):
+        fetch_model("b32", download=False)
+    assert not dest.exists()
+
+
+def test_cli_fetch_model_always_rehashes(tmp_path, monkeypatch, capsys):
+    """The explicit ``gpclean fetch-model`` command re-verifies fully, ignoring the marker."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    payload = b"cached-bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setitem(MODELS, "b32", _fake_spec(digest))
+    monkeypatch.setattr(clipmodel, "_download", _no_download)
+    _cached_file(payload)
+    fetch_model("b32")  # writes the marker
+    hashes = _count_hashes(monkeypatch)
+
+    assert clipmodel.cli_fetch_model("b32") == 0
+    assert len(hashes) == 1
+    assert "ok" in capsys.readouterr().out
+
+
+def test_marker_write_failure_is_not_fatal(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    payload = b"cached-bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setitem(MODELS, "b32", _fake_spec(digest))
+    monkeypatch.setattr(clipmodel, "_download", _no_download)
+    dest = _cached_file(payload)
+
+    def fail_replace(src, dst):
+        raise PermissionError("simulated")
+
+    monkeypatch.setattr(clipmodel.os, "replace", fail_replace)
+
+    assert fetch_model("b32") == dest
+    assert not clipmodel._marker_path(dest).exists()
+    assert sorted(p.name for p in dest.parent.iterdir()) == [dest.name]  # no temp left
 
 
 # --- real model (network) -----------------------------------------------------------------

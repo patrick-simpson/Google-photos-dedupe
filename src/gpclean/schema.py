@@ -16,7 +16,7 @@ SHARD_DDL = """
 CREATE TABLE shard_info (key TEXT PRIMARY KEY, value TEXT);
 -- keys: zipkey, zip_name, export_id, shard, cfg, extract_version, code_version, start, end,
 --       n_items, n_err, n_sidecars, n_videos, n_skipped, bytes_read, bytes_discarded,
---       pack_name, pack_sha256, pack_size, started, finished, clip_model
+--       pack_name, pack_sha256, pack_md5, pack_size, started, finished, clip_model
 
 CREATE TABLE items_raw (
   member_idx INTEGER PRIMARY KEY,   -- index into ZipFile.infolist() (central-directory order)

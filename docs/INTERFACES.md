@@ -19,8 +19,12 @@ without coordinating (tell the orchestrator what you need instead).
 - Paths: use `pathlib`. Must work on Windows and Linux. Text files UTF-8.
 - Every public function has a docstring. Keep code simple and readable; comment the *why*.
 - Tests go in `tests/test_<module>.py`, use `pytest`, synthetic data only (no network except
-  tests marked `@pytest.mark.clip` / `@pytest.mark.rclone`, which skip when unavailable).
-- Run tests with `uv run pytest tests/test_<module>.py -q`. Do not run `uv sync`/`uv add`.
+  tests marked `@pytest.mark.clip`, which skip unless `GPCLEAN_TEST_CLIP=1`, and
+  `@pytest.mark.rclone`, which skip without an rclone binary on PATH or in `GPCLEAN_RCLONE`).
+- Run tests with `uv run --frozen pytest tests/test_<module>.py -q`. Do not run `uv sync`/`uv add`.
+- Dependency groups (`pyproject.toml`): core (always), `clip` (torch, torchvision, open_clip),
+  `mcp` (the MCP SDK), `dev` (pytest). CI tests install `--group dev --group mcp`; pipeline
+  jobs `--no-dev` (+ `--group clip` for probe/scan); the Windows PC `--group clip --group mcp`.
 
 ## Takeout member layout
 Zip members look like `Takeout/Google Photos/<folder>/<filename>`. `<folder>` is either a year
@@ -210,14 +214,23 @@ def process_image(data: bytes, cfg: ScanConfig) -> tuple[dict, bytes, bytes, Ima
 ```python
 MODELS: dict[str, ModelSpec]    # "b32", "b16": open_clip name, pretrained tag, hf repo, revision,
                                 # filename, sha256, dim
-def cli_fetch_model(model: str) -> int
-def fetch_model(name: str) -> Path              # download to HF cache if needed; verify sha256
-class ImageEmbedder:  def __init__(self, name: str); def embed(self, images: list[Image]) -> np.ndarray  # (n, dim) f16 L2-normed
-class TextEmbedder:   def __init__(self, name: str); def embed(self, query: str) -> np.ndarray      # (dim,) f32 L2-normed
-class StubEmbedder:   # deterministic, torch-free; same API for both; used by tests and --no-clip-like paths
-def get_image_embedder(name: str)   # "none" -> None
+def cli_fetch_model(model: str) -> int         # always fully re-hashes a cached copy
+def fetch_model(name: str, *, download: bool = True) -> Path
+    # verified local path; downloads to the cache if needed. A cached file whose
+    # "<file>.verified" marker (sha256 + size + mtime_ns) still matches is trusted without
+    # re-hashing. Hash mismatch -> file deleted, ValueError. download=False and nothing
+    # cached -> FileNotFoundError naming `gpclean fetch-model --model <name>`.
+class ImageEmbedder:  def __init__(self, name: str, *, threads: int | None = None)
+                      def embed(self, images: list[Image]) -> np.ndarray   # (n, dim) f16 L2-normed
+class TextEmbedder:   def __init__(self, name: str)      # fetch_model(name, download=False)
+                      def embed(self, query: str) -> np.ndarray             # (dim,) f32 L2-normed
+class StubEmbedder:   def __init__(self, dim: int = 512)
+                      def embed(self, x: str | list[Image]) -> np.ndarray   # deterministic, torch-free
+def get_image_embedder(name: str, *, threads: int | None = None) -> ImageEmbedder | None  # "none" -> None
 ```
-Weights are pinned by HF commit + sha256; runtime sets `HF_HUB_OFFLINE=1` after fetching.
+Weights are pinned by HF commit + sha256 (both are `.safetensors` files); the embedders set
+`HF_HUB_OFFLINE=1` before loading. Cache: `$HF_HOME/gpclean/<repo>/<revision>/<file>`
+(`HF_HOME` unset or empty -> `~/.cache/huggingface`).
 
 ## `gpclean.scan`
 ```python
@@ -232,18 +245,51 @@ def zipkey_local(path: Path) -> str                                  # from name
 def plan_shards(entries: list[Entry], cfg: ScanConfig, *, zipkey: str, zip_name: str) -> list[ShardSpec]
     # contiguous ranges over ALL entries (so every entry lands in exactly one shard), each
     # holding about cfg.photos_per_shard image members. Deterministic.
+class ShardAborted(RuntimeError)   # zip backend failed mid-shard; nothing written; retry later
+class ShardTimeout(RuntimeError)   # deadline passed; nothing written
+
+@dataclass(frozen=True)
+class LocalOpener:  path: Path                                  # () -> ZipSource.open_local(path)
+@dataclass(frozen=True)
+class HttpOpener:   url: str; size: int; tail: bytes; timeout=60.0; retries=5; backoff=1.0
+                    tail_file: str | None = None                # set by ScanPool only
+    # Both are picklable openers; repr() hides the path / url (they name the user's files).
+
+class ScanPool:                     # spawn worker processes, reused across shards and zips
+    def __init__(self, workers: int, cfg: ScanConfig, embedder_name: str)
+    def __enter__ / __exit__ / close()   # close stops the processes, removes temp tail files
+    def prepare(self) -> None       # fetch + verify CLIP weights now (fail before any shard)
+    def run(self, opener, tasks: list, deadline: float | None = None)   # generator of results
+    # workers <= 1 runs in-process. Processes start on the first task. Not thread-safe.
+
 def scan_shard(opener, spec: ShardSpec, entries: list[Entry], cfg: ScanConfig, *,
-               meta_path: Path, pack_path: Path, workers: int,
-               embedder_name: str) -> dict
-    # opener: picklable callable returning a ZipSource (local path or http url+tail).
-    # Writes meta (SHARD_DDL) + pack (PACK_DDL) via create/finalize_transport_db.
-    # Returns shard_info dict. Spawn pool; per-worker initializer; tasks = runs of <=48 wanted
-    # consecutive members; per-item try/except storing err class name.
+               meta_path: Path, pack_path: Path, workers: int, embedder_name: str,
+               deadline: float | None = None, pool: ScanPool | None = None) -> dict
+    # entries: the zip's whole entry list (spec slices it). embedder_name: cfg.clip_model or
+    # "stub". deadline: absolute time.monotonic(). pool: reuse a ScanPool made for the same
+    # cfg + embedder (workers is then ignored; a mismatch raises ValueError); without one a
+    # pool is made for this shard. Writes the pack first, the meta (the checkpoint) last.
+    # Returns shard_info: zipkey, zip_name, export_id, shard, cfg, extract_version,
+    # code_version, start, end, n_items, n_err, n_sidecars, n_videos, n_skipped, bytes_read,
+    # bytes_discarded, pack_name, pack_sha256, pack_md5, pack_size, started, finished,
+    # clip_model. Raises ShardAborted / ShardTimeout (neither file exists afterwards).
+    # Tasks are runs of <= TASK_MAX (48) adjacent wanted members; per-item errors are stored
+    # as the exception class name (gpclean.scanworker does the per-task work).
+def read_shard_info(meta_path: Path) -> dict[str, str] | None   # None if unreadable
+def shard_is_current(meta_path: Path, pack_path: Path, cfg_hash: str) -> bool
+    # both files exist and shard_info has this cfg and the current EXTRACT_VERSION
+def default_local_workers(model: str) -> int
+    # run-local --workers 0: one per CPU; with CLIP at most LOCAL_CLIP_WORKERS_MAX (4) and
+    # at most one per 3 GB of RAM
 def cli_run_local(zips, out, include_albums, threshold, clip_model, no_clip, workers,
                   photos_per_shard) -> int
-    # scan every *.zip under `zips` into out/work/... and out/thumbs/..., then merge into
-    # `out` (a complete bundle directory). Resumable: finished shards are skipped.
+    # scan every *.zip directly in `zips` into out/work/<cfg>/<zipkey>/<shard:04d>.meta.sqlite
+    # and out/thumbs/<zipkey>-<shard:04d>.sqlite, then merge into `out` (a complete bundle
+    # directory). One ScanPool for the whole run. Resumable: current shards are skipped.
+    # Exit 2 when no .zip is found.
 ```
+`gpclean.merge.load.read_shard_info(path) -> dict` is a separate, raising variant used by the
+merge.
 
 ## `gpclean.merge`
 ```python
@@ -258,14 +304,21 @@ def cli_run_local(zips, out, include_albums, threshold, clip_model, no_clip, wor
 def build_bundle(meta_paths: list[Path], pack_dir: Path | None, out_dir: Path,
                  mcfg: MergeConfig, *, cfg_hash: str, clip_model: str,
                  expected_shards: int | None = None, pack_hashes: dict | None = None) -> dict
-    # writes out_dir/index.sqlite, out_dir/embeddings.f16.npy, out_dir/manifest.json (last).
+    # writes out_dir/index.sqlite, out_dir/embeddings.f16.npy, out_dir/manifest.json (last);
+    # returns the manifest. pack_hashes: {pack name: {"sha256", "size"}} or {name: sha256}.
+    # Raises ShardMismatch (mixed cfg) and ManifestError (a pack of unknown size).
 def regroup(bundle: Path, threshold: int) -> dict     # rewrite dup_groups/bursts/scores in place
+    # returns {"dup_groups", "exact", "near", "bursts", "scores"}; updates the manifest entry
+    # of index.sqlite. Stop `gpclean serve` / `gpclean mcp` on this bundle first.
 def cli_regroup(bundle, threshold) -> int
 ```
 Bundle directory layout: `index.sqlite`, `embeddings.f16.npy`, `manifest.json`,
 `thumbs/<zipkey>-<shard:04d>.sqlite`. `manifest.json`:
 `{"index_schema", "cfg", "extract_version", "code_version", "created_at", "partial": bool,
 "missing_shards": int, "clip_model", "counts": {...}, "files": [{"path", "size", "sha256"}]}`.
+`gpclean ci-merge` also writes `"mode"` (`full` | `selftest` | ...; get-bundle skips
+`selftest` bundles unless named with `-Cfg`) and, for non-selftest runs, `"folder"` (the Drive
+folder, shown to the user). Local `run-local` bundles do not have these keys.
 
 ## `gpclean.bundle_read`
 ```python
@@ -283,10 +336,13 @@ class Bundle:
     def dup_group_of(self, item_id: int) -> dict | None
     def bursts(self, *, offset=0, limit=50) -> list[dict]
     def burst_of(self, item_id: int) -> dict | None
-    def junk(self, category: str, *, min_score: float, year: int | None, offset: int, limit: int) -> tuple[list[dict], int]
+    def junk(self, category: str, *, min_score: float, year: int | None = None,
+             offset: int = 0, limit: int = 50) -> tuple[list[dict], int]
     def videos_by_day(self) -> dict[str, int]
     def stats(self) -> dict
-    def close(self) -> None
+    def close(self) -> None           # also a context manager (with Bundle(p) as b: ...)
+    path: Path
+THUMB_SIZES = ("g", "p"); JUNK_DEFAULT_MIN = 0.5; DUP_KINDS = ("exact", "near")
 ```
 
 ## `gpclean.review_db`
@@ -299,8 +355,11 @@ class ReviewDB:
         # existing approved/rejected rows; never re-proposes a rejected uid. Enforces
         # MAX_OPEN_PROPOSALS=2000. Returns {"added", "already", "rejected_skipped", "capped"}.
     def withdraw(self, uids: list[str], *, proposer: str) -> int   # only own 'proposed' rows
-    def user_add(self, items: list[tuple[str, str, str | None]]) -> int   # status 'approved', proposed_by 'user'
-    def decide(self, uids: list[str], decision: str) -> int       # approve | reject | reset(->proposed or delete if user)
+    def user_add(self, items: list[tuple[str, str, str | None]], *,
+                 guard: Guard | None = None) -> int   # status 'approved', proposed_by 'user'
+    def decide(self, uids: list[str], decision: str, *,
+               guard: Guard | None = None) -> int     # approve | reject | reset(->proposed or delete if user)
+    def approved_among(self, uids, conn=None) -> set[str]   # subset whose status is 'approved'
     def reject_batch(self, batch_id: str) -> int
     def mark_deleted(self, uids: list[str], deleted: bool) -> int
     def list(self, status: str, *, offset=0, limit=100) -> list[dict]   # status proposed|approved|rejected|deleted|all
@@ -310,7 +369,11 @@ class ReviewDB:
     def group_decisions(self) -> dict[str, dict]
 ```
 Writes use `BEGIN IMMEDIATE`. Every write appends to `events`. Reasons are sanitised
-(control/bidi chars stripped, 3..300 chars).
+(control/bidi chars stripped, 3..300 chars). `Guard = Callable[[sqlite3.Connection], None]`:
+it runs inside the write transaction before anything is written, may only read (e.g. with
+`approved_among(uids, conn)`), and raises to refuse the write (the site's "never approve a
+whole duplicate group" check). Constants: `STATUSES`, `LIST_STATUSES`, `DECISIONS`,
+`GROUP_ACTIONS`, `MAX_OPEN_PROPOSALS`. `ReviewDB` is a context manager.
 
 ## `gpclean.search`
 ```python
@@ -318,8 +381,13 @@ Writes use `BEGIN IMMEDIATE`. Every write appends to `events`. Reasons are sanit
 class SearchParams:  query, category, min_score, date_from, date_to, year, filename_contains,
                      origin_contains, group ("dup:<id>"|"burst:<id>"), has_gps, exclude_queued,
                      sort ("score"|"date"|"similarity"), limit, offset
+    # every field optional (defaults None; exclude_queued=True, limit=50, offset=0);
+    # SearchParams.validate() raises ValueError. category may be "any". sort=None picks
+    # similarity for a query, score for a category, else date.
 def search(bundle: Bundle, review: ReviewDB | None, p: SearchParams, text_embedder=None) -> dict
-    # {"total": int, "offset": int, "next_offset": int | None, "rows": [item dicts + flags + sim]}
+    # {"total": int, "offset": int, "next_offset": int | None, "rows": [...]}; each row is an
+    # item dict + score, flags, sim, queue, and dup_group/is_keeper/burst/is_best if any.
+SORTS = ("score", "date", "similarity"); SIM_THRESHOLD = 0.18; MAX_LIMIT = 200
 ```
 
 ## `gpclean.sheet`
@@ -327,23 +395,66 @@ def search(bundle: Bundle, review: ReviewDB | None, p: SearchParams, text_embedd
 def render_sheet(bundle: Bundle, ids: list[int], *, detail: str = "standard",
                  queued: set[int] = frozenset(), keepers: set[int] = frozenset()) -> tuple[bytes, list[str]]
     # JPEG bytes + legend lines "n=<cell> id=<id> <date> <filename> <flags>"
-    # standard: 8 cols, 154 px cells, <= 1232x924 ; high: <= 20 cells ~300 px from previews, same canvas
+    # standard: 1..48 ids (MAX_STANDARD), 8 cols of 154 px cells from grid thumbs, <= 1232x924;
+    # high: 1..20 ids (MAX_HIGH) from previews: 4 cols of 308 px (<= 12) or 5 cols of 231 px.
+    # Raises ValueError for a bad count or detail.
+def layout_for(n: int, detail: str) -> Layout      # cols, rows, cell, gutter, font_px, source; .size
+def image_tokens(width: int, height: int) -> int    # ceil(w/28) * ceil(h/28)
+def preview_jpeg(bundle: Bundle, item_id: int, max_edge: int = 640) -> bytes | None   # view_photo
+def dup_uncertainty(bundle, ids) -> tuple[set[int], set[int]]  # (uncertain group ids, maybe-same ids)
+# text helpers shared with the MCP server: clean_text, when, junk_flags, attr_flags, group_tag,
+# to_jpeg; DETAILS = ("standard", "high"); MAYBE_SAME_FLAG = "maybe-same-item"
 ```
 
 ## `gpclean.mcp_server`, `gpclean.site.server`, `gpclean.localinit`
 ```python
-# mcp_server.py
-def build_server(home: Path) -> "FastMCP"
-def cli_mcp(home) -> int
+# mcp_server.py  (mcp 2.x: FastMCP was renamed MCPServer, in mcp.server.mcpserver)
+class Tools:                       # the tool logic as plain methods; tests call it directly
+    def __init__(self, home: Path, *, text_embedder_factory: Callable[[str], Any] | None = None)
+    def stats(self) -> str
+    def search(self, query=None, category=None, min_score=None, date_from=None, date_to=None,
+               year=None, filename_contains=None, origin_contains=None, group=None,
+               has_gps=None, exclude_queued=True, sort=None, limit=50, offset=0,
+               verbose=False) -> str
+    def contact_sheet(self, ids: list[int], detail: str = "standard") -> tuple[bytes, str]
+    def view_photo(self, id: int) -> tuple[bytes | None, str]
+    def queue_add(self, items: list[dict], category: str | None = None, *,
+                  client: str | None = None) -> str       # items: [{"id", "reason"}]
+    def queue_remove(self, ids: list[int], *, client: str | None = None) -> str
+    def queue_list(self, status: str = "proposed", limit: int = 50, offset: int = 0) -> str
+    def close(self) -> None
+class ToolInputError(ValueError)   # bad input -> an MCP tool error Claude can read
+def build_server(home: Path, *, tools: Tools | None = None) -> "mcp.server.mcpserver.MCPServer"
+    # imports mcp only here; registers the 7 tools (read-only ones annotated readOnlyHint);
+    # the returned server carries .gpclean_tools (the Tools instance)
+def cli_mcp(home) -> int           # logging to stderr + <home>/state/logs/mcp.log; run("stdio")
+def client_proposer(client_name: object) -> str   # "claude:<client>" for ReviewDB.propose
+def estimate_tokens(text: str) -> int             # ~3.5 characters per token (8k budget)
 # site/server.py
-def make_server(home: Path, port: int = 8765) -> ThreadingHTTPServer   # for tests (port 0 ok)
-def cli_serve(home, port, no_browser) -> int
+def make_server(home: Path, port: int = 8765, *, text_embedder=None) -> SiteServer
+    # SiteServer(ThreadingHTTPServer) bound to 127.0.0.1 (port 0 ok for tests), with .app
+    # (a SiteApp). Without text_embedder call server.app.start_text_loader().
+def cli_serve(home, port, no_browser) -> int   # exit 2: no bundle configured / port in use
 # localinit.py
-def home_paths(home: Path) -> dict      # state_dir, review_db, config_json, review_dir, bundle
-def current_bundle(home: Path) -> Path  # from state/config.json
-def cli_init(home, bundle) -> int       # writes state/config.json; creates review/.claude/settings.json
-def cli_mcp_config(home) -> int
-def cli_verify_bundle(bundle) -> int
+def home_paths(home: Path) -> dict[str, Path]
+    # home, state_dir, config_json (state/config.json), review_db (state/review.sqlite),
+    # logs_dir (state/logs), review_dir (review), bundles_dir (bundle). Creates nothing.
+def current_bundle(home: Path) -> Path  # from state/config.json; FileNotFoundError if unset
+def load_manifest(bundle: Path) -> dict # ValueError with a plain-language reason
+def check_bundle_files(bundle: Path, manifest: dict, *, full: bool, progress=None) -> BundleCheck
+    # full=False: presence + size (init); full=True: also sha256 (verify-bundle)
+@dataclass
+class BundleCheck:  total: int; ok, bad, missing, errors: list[str]; passed: bool (property)
+def check_index_schema(bundle: Path) -> str | None   # problem text or None
+def write_review_folder(review_dir: Path) -> None     # review/.claude/settings.json + CLAUDE.md
+REVIEW_SETTINGS: dict; REVIEW_CLAUDE_MD: str
+def gpclean_executable(python: str | None = None, *, windows: bool | None = None) -> str
+def mcp_snippets(home: str, exe: str, *, windows: bool) -> tuple[str, str]  # (claude cmd, desktop JSON)
+def cli_init(home, bundle) -> int
+    # quick-checks the bundle, writes state/config.json atomically, creates state/logs and the
+    # review DB, and (re)writes review/.claude/settings.json + review/CLAUDE.md
+def cli_mcp_config(home) -> int         # prints "=== 1) Claude Code ===" / "=== 2) Claude Desktop ==="
+def cli_verify_bundle(bundle) -> int    # 0 only when every file's size + sha256 matches
 ```
 
 ## `gpclean.publiclog`
@@ -379,17 +490,49 @@ Inputs from env: `GPCLEAN_FOLDER`, `GPCLEAN_THRESHOLD`, `GPCLEAN_INCLUDE_ALBUMS`
 `GPCLEAN_CLIP_MODEL`, `GPCLEAN_WORKERS`, `GPCLEAN_RUN_ID`, `GPCLEAN_ATTEMPT`,
 `GPCLEAN_OUT_ROOT` (default `gpclean-output`), `GPCLEAN_REMOTE` (default `gp`),
 `RCLONE_CONFIG`, `GPCLEAN_PRIVATE_DIR`, `GPCLEAN_PUBLIC_FD`, `GPCLEAN_SELFTEST_FAIL_SHARD`.
-Outputs via `publiclog.github_output` (integers / JSON int lists only).
+Outputs via `publiclog.github_output` (integers / JSON int lists only). More knobs
+(`GPCLEAN_PASS`, `GPCLEAN_PENDING_IDS`, `GPCLEAN_JOB`, `GPCLEAN_WORKER`, `GPCLEAN_JOB_BUDGET_MIN`,
+`GPCLEAN_SCAN_PROCS`, `GPCLEAN_PHOTOS_PER_SHARD`, `GPCLEAN_RCLONE`, `GPCLEAN_PENDING_QUOTA`, the
+`ci-report` inputs) are listed in the `gpclean.ci` module docstring.
+```python
+EXIT_OK, EXIT_FAIL, EXIT_QUOTA = 0, 1, 3      # 3: Drive quota / download limit (resume later)
+MODES = ("full", "probe", "merge_only", "selftest")
+@dataclass(frozen=True)
+class CiEnv:   # validated inputs: folder, threshold, include_albums, mode, clip_model, workers,
+               # run_id, attempt, out_root, remote, rclone_config, private_dir, pass_no,
+               # fail_shard, photos_per_shard, job_budget_min, scan_procs, job, worker
+    scan_cfg: ScanConfig; cfg: str; run_tag: str; source: str; out_remote: str   # properties
+def load_env(environ: dict | None = None) -> CiEnv   # ValueError on a bad value
+def make_rclone(env) -> Rclone; def make_store(env, rc)   # test seams (tests swap them)
+def run_step(phase: int, body: Callable[[CiEnv], int]) -> int   # logging, excepthook, exit codes
+def shards_rel(cfg) / meta_rel(cfg, zipkey, shard) / pack_name(zipkey, shard) / pack_rel(cfg, zipkey, shard) -> str
+def scope_check(env, rc) -> bool         # mask secrets, refresh token, exactly the two scopes
+def mask_config_secrets(path) -> int; def tokeninfo_scopes(access_token) -> set[str]
+def list_zip_files(rc, source) -> list[dict]; def split_duplicates(zips) -> tuple[list[dict], int]
+def list_zips(rc, source) -> list[dict]  # zips whose name is unique in the folder
+def zip_url(base, name) -> str; def read_zip_entries(url, size) -> tuple[bytes, list[Entry]]
+def validate_table(table, cfg) -> dict; def load_table(store, cfg, *, required=True) -> dict | None
+def save_table(store, table) -> None; def extend_table(table, listed, new_entries, cfg) -> dict
+def present_shards(table) -> list[dict]; def done_set(store, cfg) -> set[tuple[str, int]]
+def pending_ids(table, done) -> list[int]
+def pack_matches_listing(info: dict, entry: dict) -> bool   # size, then md5, else sha256
+def quota_reset_hour_utc(now=None) -> int  # UTC hour of the next midnight Pacific time
+def cli_scope_check() / cli_plan() / cli_pending() / cli_scan(worker, of) / cli_finalize()
+    / cli_merge() / cli_report() / cli_upload_logs() / cli_selftest_upload() -> int
+```
+`gpclean.probe.cli_probe() -> int` runs `mode=probe` (50-minute internal budget).
 
 ## Fixtures (`gpclean.fixtures.generate`)
 ```python
 def generate(out: Path, *, seed: int = 0, small: bool = False) -> dict   # writes zips + expected.json
-def cli_generate(out, seed, small) -> int
+def expected_view(expected: dict, *, include_albums: bool) -> dict       # truth for a default run
+def cli_generate(out: Path, seed: int = 0, small: bool = False) -> int
 ```
 Writes `out/takeout-20260101T000000Z-001.zip`, `-002.zip` (export A) and
 `out/takeout-20260201T000000Z-001.zip` (export B), plus `out/expected.json`:
 ```json
 {
+  "include_albums": true,
   "item_keys": {"<zip>::<member>": "<item_key>"},       // every image member -> library item key
   "dup_groups": [{"id": "P1", "members": ["<item_key>", ...], "keeper": "<item_key>"}],
   "must_not_group": [["<item_key>", "<item_key>"], ...],
@@ -398,6 +541,7 @@ Writes `out/takeout-20260101T000000Z-001.zip`, `-002.zip` (export A) and
   "bursts": [{"id": "N4", "members": ["<item_key>", ...], "best": "<item_key>"}],
   "junk": {"<item_key>": ["screenshot", "messaging", ...]},
   "videos": {"members": ["<zip>::<member>", ...], "by_day": {"YYYY-MM-DD": n}},
+  "unindexed_by_day": {"YYYY-MM-DD": n},              // videos + unindexed images per day
   "skipped": {"<zip>::<member>": "<reason>"},
   "n_items": 0
 }
@@ -434,15 +578,18 @@ exists.
 
 **clipmodel**
 - Pins: b32 `laion/CLIP-ViT-B-32-DataComp.XL-s13B-b90K@f0e2ffa0…` `open_clip_model.safetensors`;
-  b16 `laion/CLIP-ViT-B-16-DataComp.XL-s13B-b90K@d110532e…` `open_clip_pytorch_model.bin`
-  (loaded with `weights_only=True`). Cache: `$HF_HOME/gpclean/...`.
-- The scan parent must call `fetch_model(name)` once BEFORE starting the pool; workers only load.
+  b16 `laion/CLIP-ViT-B-16-DataComp.XL-s13B-b90K@05fa70d8…` `open_clip_pytorch_model.safetensors`
+  (the repo's refs/pr/2 conversion, checked bit-identical to main's `.bin`; no pickle is ever
+  loaded). Cache: `$HF_HOME/gpclean/...`.
+- The scan parent fetches the weights once BEFORE any worker starts (`ScanPool.prepare()` /
+  the first `ScanPool.run()`); workers only load.
 - `get_image_embedder(name, *, threads=None)`; `StubEmbedder(dim).embed(str | list[Image])`.
 
 **publiclog**
 - Import early (it removes `GPCLEAN_PUBLIC_FD` from `os.environ` at import). Lines look like
   `PROGRESS phase=2 done=10`. Helpers: `set_phase(n)`, `disable_public()` (call it in scan worker
-  initializers), `setup_logging()` returns the private log path (`gpclean.log`).
+  initializers), `add_mask(secret)` (`::add-mask::`), `setup_logging(private_dir=None, *,
+  level=INFO)` returns the private log path (`gpclean.log`) or None.
   `github_output` accepts ints, bools, restricted strings and lists of ints (compact JSON).
 
 **rclone / store**
@@ -466,7 +613,9 @@ exists.
   `ReviewDB.uids()`, `batches()`, `events()`, `close()`. `search()` raises
   `SearchUnavailable(ValueError)` for a text query without embedder/embeddings.
 - `tests/bundle_factory.py` (`make_bundle`, `plan_items`, `StubTextEmbedder`) is the shared test
-  helper for site / MCP / sheet tests (`from bundle_factory import ...`).
+  helper for site / MCP / sheet tests (`from bundle_factory import ...`);
+  `tests/shard_factory.py` (`ShardWriter`, `shards_from_zips`, `textured`, `fake_url`) makes
+  synthetic shard meta files for merge tests.
 
 **fixtures**
 - `expected.json` describes an `include_albums=true` run (top-level `"include_albums": true`);
@@ -480,3 +629,18 @@ exists.
   reusable workflows, top-level `permissions: {}`, `persist-credentials: false`, no
   `secrets: inherit`, no `: write` permissions, no `${{ }}` inside `run:` except bare
   `${{ matrix.x }}`; `pull_request` only in ci.yml; no denied rclone verbs in code or scripts.
+
+## Addenda from wave 3
+- A 0-byte `work/<cfg>/<zipkey>/<shard>.meta.sqlite` is a **tombstone** the merge writes for a
+  checkpoint it rejected (not SQLite, wrong cfg/pack, pack md5/size mismatch, pack missing). It
+  counts as pending, so the next pass rescans that shard; nothing needs deleting by hand. The
+  merge prints `COUNT phase=6 rejected=N` publicly.
+- `rclone serve http` runs with `--buffer-size 0` (no read-ahead past the requested range); the
+  probe reports `over_read_ratio` so this can be tuned. The rclone wrapper passes only
+  `RCLONE_CONFIG` / `RCLONE_CONFIG_PASS` from the environment to child processes.
+- `shard_info` has `pack_md5`; the merge prefers Drive's `md5Checksum` to verify packs.
+- `ReviewDB.user_add(..., guard=None)` and `ReviewDB.decide(..., guard=None)`: the guard runs
+  inside the write transaction (the site uses it to enforce dup-group/override rules across
+  processes).
+- Weights verification leaves a `<file>.verified` marker (sha256, size, mtime_ns); later loads
+  trust it only while size and mtime match.

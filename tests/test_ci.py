@@ -552,20 +552,29 @@ def test_selftest_forced_failure_then_pass2_completes(drive, monkeypatch, capfd)
     assert ci.cli_selftest_upload() == ci.EXIT_OK
     assert sorted(p.name for p in (drive.store.root / "selftest").iterdir()) == sorted(ZIP_NAMES)
     assert ci.cli_plan() == ci.EXIT_OK
-    assert drive.outputs()["n_shards"] == "3"
+    # Shards of 10: the 44- and 33-photo zips are cut into 4 and 3 shards, the 5-photo zip
+    # is one, so the selftest covers shards that start mid-zip and several packs per zip.
+    assert drive.outputs()["n_shards"] == "8"
     env = ci.load_env()
+    tbl = table(drive, env.cfg)
+    per_zip = {}
+    for s in tbl["shards"]:
+        per_zip.setdefault(s["zipkey"], []).append(s)
+    assert sorted(len(v) for v in per_zip.values()) == [1, 3, 4]
+    assert any(s["start"] > 0 for s in tbl["shards"])
 
     check_console()
     p1 = _run_pass(drive, 1, monkeypatch)
     check_console()
-    assert p1["pending"]["workers"] == "[0,1,2]"
-    assert p1["codes"] == [0, 1, 0]  # worker 1 got the shard that fails on purpose
+    assert p1["pending"]["workers"] == "[0,1,2,3,4,5]"
+    assert p1["codes"] == [0, 1, 0, 0, 0, 0]  # worker 1 got the shard that fails on purpose
     assert (p1["done"], p1["quota"]) == ("false", "false")
-    # The failed shard left nothing behind; the others uploaded pack and meta.
-    tbl = table(drive, env.cfg)
-    failed = tbl["shards"][1]
-    assert not (drive.store.root / ci.meta_rel(env.cfg, failed["zipkey"], 0)).exists()
-    assert len(ci.done_set(drive.store, env.cfg)) == 2
+    # The failed shard (the second one, mid-zip) left nothing behind; the others uploaded
+    # pack and meta.
+    failed = tbl["shards"][ci.SELFTEST_FAIL_SHARD]
+    assert failed["shard"] == 1 and failed["start"] > 0
+    assert not (drive.store.root / ci.meta_rel(env.cfg, failed["zipkey"], 1)).exists()
+    assert len(ci.done_set(drive.store, env.cfg)) == 7
 
     p2 = _run_pass(drive, 2, monkeypatch)
     check_console()
@@ -581,6 +590,8 @@ def test_selftest_forced_failure_then_pass2_completes(drive, monkeypatch, capfd)
     bundle = drive.store.root / "bundle" / env.cfg
     manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["partial"] is False and manifest["cfg"] == env.cfg
+    # get-bundle.ps1 relies on this marker to never download a selftest bundle.
+    assert manifest["mode"] == "selftest" and "folder" not in manifest
     assert manifest["counts"]["items"] > 50
     packs = {f["path"] for f in manifest["files"] if f["path"].startswith("thumbs/")}
     assert packs == {f"thumbs/{ci.pack_name(s['zipkey'], s['shard'])}" for s in tbl["shards"]}
@@ -621,6 +632,7 @@ def test_merge_of_a_partial_scan_is_marked_partial(drive, monkeypatch):
     manifest = json.loads((drive.store.root / "bundle" / env.cfg / "manifest.json")
                           .read_text(encoding="utf-8"))
     assert manifest["partial"] is True and manifest["missing_shards"] == 2
+    assert manifest["mode"] == env.mode and manifest["folder"] == env.folder
 
 
 def test_quota_stop_exits_3_and_finalize_reports_it(drive, monkeypatch, capfd):
@@ -803,7 +815,7 @@ def test_scan_stops_after_consecutive_failures(tmp_path, monkeypatch, capfd):
     _hand_made_table(tmp_path, monkeypatch, 5)
     calls = []
 
-    def failing(env, cache, store, s, tmp, *, fail, deadline):
+    def failing(env, cache, store, s, tmp, *, pool, fail, deadline):
         calls.append(s["id"])
         raise OSError("backend down")
 
@@ -845,6 +857,89 @@ def test_scan_passes_the_shard_deadline(tmp_path, monkeypatch, budget_min):
         assert deadline == min(now + ci.SHARD_TIMEOUT_S, hard_stop)
 
 
+def test_scan_uses_one_pool_for_the_whole_job(tmp_path, monkeypatch):
+    """Every shard of a job runs on the same ScanPool; the model is prepared once, up front."""
+    pytest.importorskip("gpclean.scan")
+    import gpclean.scan
+
+    _hand_made_table(tmp_path, monkeypatch, 3)
+    monkeypatch.setattr(ci._ZipCache, "get", lambda self, key: (object(), [None] * 5))
+    events = []
+
+    class FakePool:
+        def __init__(self, workers, cfg, embedder_name):
+            env = ci.load_env()
+            assert (workers, cfg, embedder_name) == (env.scan_procs, env.scan_cfg,
+                                                    env.clip_model)
+            events.append("open")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            events.append("close")
+
+        def prepare(self):
+            events.append("prepare")
+
+    pools = []
+
+    def recorder(opener, spec, entries, cfg, *, meta_path, pack_path, workers,
+                 embedder_name, deadline=None, pool=None):
+        pools.append(pool)
+        events.append("shard")
+        meta_path.write_bytes(b"m")
+        pack_path.write_bytes(b"p")
+        return {}
+
+    monkeypatch.setattr(gpclean.scan, "ScanPool", FakePool)
+    monkeypatch.setattr(gpclean.scan, "scan_shard", recorder)
+    assert ci.cli_scan(worker=0, of=1) == ci.EXIT_OK
+    assert events == ["open", "prepare", "shard", "shard", "shard", "close"]
+    assert len(pools) == 3 and isinstance(pools[0], FakePool)
+    assert all(p is pools[0] for p in pools)
+
+
+def test_scan_fails_before_any_shard_when_the_model_cannot_be_prepared(tmp_path, monkeypatch):
+    pytest.importorskip("gpclean.scan")
+    import gpclean.scan
+
+    _hand_made_table(tmp_path, monkeypatch, 2)
+    calls = []
+    monkeypatch.setattr(ci, "_scan_one", lambda *a, **k: calls.append(a))
+
+    def broken(self):
+        raise RuntimeError("model hash mismatch")
+
+    monkeypatch.setattr(gpclean.scan.ScanPool, "prepare", broken)
+    assert ci.cli_scan(worker=0, of=1) == ci.EXIT_FAIL
+    assert calls == []
+
+
+def test_real_scan_checkpoint_records_the_pack_md5(drive, monkeypatch):
+    """The checkpoint's pack_md5 is what Drive lists as md5Checksum for the uploaded pack."""
+    pytest.importorskip("gpclean.scan")
+    from gpclean.scan import read_shard_info
+
+    assert ci.cli_plan() == ci.EXIT_OK
+    env = ci.load_env()
+    monkeypatch.setenv("GPCLEAN_PASS", "1")
+    monkeypatch.setenv("GPCLEAN_PENDING_IDS", "[0]")
+    assert ci.cli_scan(worker=0, of=1) == ci.EXIT_OK
+    s = table(drive, env.cfg)["shards"][0]
+    meta = drive.store.root / ci.meta_rel(env.cfg, s["zipkey"], s["shard"])
+    pack = drive.store.root / ci.pack_rel(env.cfg, s["zipkey"], s["shard"])
+    info = read_shard_info(meta)
+    data = pack.read_bytes()
+    assert info["pack_md5"] == hashlib.md5(data).hexdigest()
+    # Drive without a sha256Checksum: md5 alone still catches a changed pack.
+    listed = {"Size": len(data), "Hashes": {"md5": hashlib.md5(data).hexdigest()}}
+    assert ci.pack_matches_listing(info, listed)
+    changed = bytes([data[0] ^ 1]) + data[1:]
+    listed["Hashes"]["md5"] = hashlib.md5(changed).hexdigest()
+    assert not ci.pack_matches_listing(info, listed)
+
+
 def test_merge_skips_a_bad_checkpoint_or_pack(drive, monkeypatch):
     pytest.importorskip("gpclean.scan")
     pytest.importorskip("gpclean.merge.bundle")
@@ -861,19 +956,90 @@ def test_merge_skips_a_bad_checkpoint_or_pack(drive, monkeypatch):
     assert ci.cli_merge() == ci.EXIT_OK
     assert drive.outputs() == {"partial": "true", "missing": "2"}
 
-    # An unreadable checkpoint: that shard counts as missing, the merge still publishes.
+    # An unreadable checkpoint: that shard counts as missing, the merge still publishes,
+    # and the checkpoint becomes a 0-byte tombstone (test_a_rejected_checkpoint_is_rescanned
+    # shows the next pass rescanning it). Writing the good bytes back stands in for that.
     meta.write_bytes(b"not a database")
     assert ci.cli_merge() == ci.EXIT_OK
     assert drive.outputs() == {"partial": "true", "missing": "3"}
+    assert meta.stat().st_size == 0
     meta.write_bytes(good_meta)
 
     # A pack overwritten after its meta (same size, other bytes): the listed hash differs.
     pack.write_bytes(bytes([good_pack[0] ^ 1]) + good_pack[1:])
     assert ci.cli_merge() == ci.EXIT_OK
     assert drive.outputs() == {"partial": "true", "missing": "3"}
+    assert meta.stat().st_size == 0
+    assert ci.cli_merge() == ci.EXIT_OK  # a tombstone alone is simply not done
+    assert drive.outputs() == {"partial": "true", "missing": "3"}
     pack.write_bytes(good_pack)
+    meta.write_bytes(good_meta)
     assert ci.cli_merge() == ci.EXIT_OK
     assert drive.outputs() == {"partial": "true", "missing": "2"}
+
+
+def _pending_ids_now(drive: Drive) -> list[int]:
+    drive.outputs()
+    assert ci.cli_pending() == ci.EXIT_OK
+    return json.loads(drive.outputs()["ids"])
+
+
+@pytest.mark.parametrize("damage", ["pack_bytes", "meta_bytes", "no_pack"])
+def test_a_rejected_checkpoint_is_rescanned(drive, monkeypatch, capfd, damage):
+    """The merge tombstones a checkpoint it cannot use; the next pass rescans that shard."""
+    pytest.importorskip("gpclean.scan")
+    pytest.importorskip("gpclean.merge.bundle")
+    assert ci.cli_plan() == ci.EXIT_OK
+    env = ci.load_env()
+    assert _run_pass(drive, 1, monkeypatch)["done"] == "true"
+    assert ci.cli_merge() == ci.EXIT_OK
+    assert drive.outputs() == {"partial": "false", "missing": "0"}
+
+    s = table(drive, env.cfg)["shards"][1]
+    meta = drive.store.root / ci.meta_rel(env.cfg, s["zipkey"], s["shard"])
+    pack = drive.store.root / ci.pack_rel(env.cfg, s["zipkey"], s["shard"])
+    if damage == "pack_bytes":
+        data = pack.read_bytes()
+        pack.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    elif damage == "meta_bytes":
+        meta.write_bytes(b"not a database")
+    else:
+        pack.unlink()
+    capfd.readouterr()
+    assert ci.cli_merge() == ci.EXIT_OK
+    assert drive.outputs() == {"partial": "true", "missing": "1"}
+    assert f"COUNT phase={ci.PHASE_MERGE} rejected=1" in public_lines(capfd.readouterr().err)
+    # The checkpoint is now a 0-byte tombstone: pending again, but the file is still there
+    # (the merge cannot delete anything on Drive).
+    assert meta.is_file() and meta.stat().st_size == 0
+    assert (s["zipkey"], s["shard"]) not in ci.done_set(drive.store, env.cfg)
+    assert _pending_ids_now(drive) == [s["id"]]
+
+    # The next pass rescans it (overwriting pack and tombstone); the merge is whole again.
+    p2 = _run_pass(drive, 2, monkeypatch)
+    assert p2["pending"]["count"] == "1" and p2["codes"] == [0] and p2["done"] == "true"
+    assert meta.stat().st_size > 0 and pack.is_file()
+    assert ci.cli_merge() == ci.EXIT_OK
+    assert drive.outputs() == {"partial": "false", "missing": "0"}
+    assert _pending_ids_now(drive) == []
+
+
+def test_done_set_ignores_tombstones_and_other_files(tmp_path):
+    store = LocalStore(tmp_path)
+    cfg = "c" * 12
+    good = tmp_path / ci.meta_rel(cfg, "a" * 12, 0)
+    dead = tmp_path / ci.meta_rel(cfg, "a" * 12, 1)
+    other = tmp_path / "work" / cfg / ("a" * 12) / "notes.txt"
+    for path, data in ((good, b"x"), (dead, b""), (other, b"y")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    assert ci.done_set(store, cfg) == {("a" * 12, 0)}
+    assert ci.list_sizes(store, f"work/{cfg}") == {
+        f"{'a' * 12}/0000.meta.sqlite": 1, f"{'a' * 12}/0001.meta.sqlite": 0,
+        f"{'a' * 12}/notes.txt": 1}
+    assert ci.done_set(store, "d" * 12) == set()  # a missing folder lists as empty
+    ci.tombstone(store, cfg, "a" * 12, 0)
+    assert good.stat().st_size == 0 and ci.done_set(store, cfg) == set()
 
 
 def test_pack_matches_listing():
@@ -1072,3 +1238,18 @@ def test_real_rclone_plan_scan_merge(tmp_path, monkeypatch, fx):
     bundle = root / "gpclean-output" / "bundle" / cfg
     assert {p.name for p in bundle.iterdir()} >= {"index.sqlite", "embeddings.f16.npy",
                                                   "manifest.json", "thumbs"}
+
+    # A pack changed on Drive: the merge tombstones its meta through RcloneStore, and the
+    # real lsjson sizes make the shard pending again.
+    s = json.loads((root / "gpclean-output" / ci.shards_rel(cfg)).read_text(encoding="utf-8")
+                   )["shards"][2]
+    pack = root / "gpclean-output" / ci.pack_rel(cfg, s["zipkey"], s["shard"])
+    data = pack.read_bytes()
+    pack.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    assert ci.cli_merge() == ci.EXIT_OK
+    assert out() == {"partial": "true", "missing": "3"}
+    meta = root / "gpclean-output" / ci.meta_rel(cfg, s["zipkey"], s["shard"])
+    assert meta.is_file() and meta.stat().st_size == 0
+    monkeypatch.delenv("GPCLEAN_PENDING_IDS")
+    assert ci.cli_pending() == ci.EXIT_OK
+    assert out()["ids"] == "[0,1,2]"

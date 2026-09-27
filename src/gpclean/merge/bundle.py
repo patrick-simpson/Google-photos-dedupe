@@ -278,9 +278,47 @@ def _embeddings(rows: list[dict]) -> np.ndarray:
     return np.stack(vecs).astype(np.float16)
 
 
+class ManifestError(ValueError):
+    """A manifest entry cannot be written truthfully (e.g. a thumb pack of unknown size)."""
+
+
+def _known_size(value) -> int | None:
+    """A recorded file size as an int, or None when it is missing / empty / zero.
+
+    Shard info stores numbers as text, callers may pass ints; anything else that is not a
+    non-negative whole number is a corrupt record and raises :class:`ManifestError`.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        raise ManifestError("thumb pack size is not a number") from None
+    if size < 0:
+        raise ManifestError("thumb pack size is negative")
+    return size or None  # a real pack is never empty: 0 means "not recorded"
+
+
+def _pack_size(name: str, local: Path, *recorded) -> int:
+    """Size of a thumb pack for its manifest entry: the first recorded size, else the local
+    file's; with neither, fail now rather than write an entry the site cannot verify."""
+    for value in recorded:
+        size = _known_size(value)
+        if size is not None:
+            return size
+    if local.is_file():
+        return local.stat().st_size
+    raise ManifestError(f"thumb pack {name}: size unknown (not recorded and not present "
+                        "locally)")
+
+
 def _pack_entries(loaded: Loaded, pack_dir: Path | None, out_dir: Path,
                   pack_hashes: dict | None) -> list[dict]:
-    """Manifest entries for the thumb packs of the loaded shards (copying local packs in)."""
+    """Manifest entries for the thumb packs of the loaded shards (copying local packs in).
+
+    Every entry has an int ``size``: a pack whose hash is known but whose size is neither
+    recorded nor measurable locally raises :class:`ManifestError`.
+    """
     thumbs = out_dir / "thumbs"
     entries = []
     by_name = {pack_name_of(s): s for s in loaded.shards}
@@ -296,16 +334,15 @@ def _pack_entries(loaded: Loaded, pack_dir: Path | None, out_dir: Path,
         if isinstance(given, str):
             given = {"sha256": given}
         if given and given.get("sha256"):
-            size = given.get("size", info.get("pack_size"))
-            entries.append({"path": f"thumbs/{name}", "size": int(size) if size else None,
-                            "sha256": given["sha256"]})
+            size = _pack_size(name, dst, given.get("size"), info.get("pack_size"))
+            entries.append({"path": f"thumbs/{name}", "size": size, "sha256": given["sha256"]})
         elif dst.is_file():
             entries.append(_file_entry(out_dir, f"thumbs/{name}"))
         elif info.get("pack_sha256"):
             # CI: the scan uploaded the pack straight into the bundle folder and recorded its
-            # hash, so the merge never downloads it.
-            size = info.get("pack_size")
-            entries.append({"path": f"thumbs/{name}", "size": int(size) if size else None,
+            # hash (and size), so the merge never downloads it.
+            size = _pack_size(name, dst, info.get("pack_size"))
+            entries.append({"path": f"thumbs/{name}", "size": size,
                             "sha256": info["pack_sha256"]})
         else:
             log.warning("thumb pack has no hash and is not present locally")
@@ -330,8 +367,9 @@ def build_bundle(meta_paths: list[Path], pack_dir: Path | None, out_dir: Path,
 
     ``pack_dir`` holds the thumb packs when they are local (they are copied to
     ``out_dir/thumbs`` unless already there). ``pack_hashes`` ({pack name: {"sha256",
-    "size"}} or {name: sha256}) overrides hashing. ``expected_shards`` larger than the number
-    of meta files marks the bundle partial.
+    "size"}} or {name: sha256}) overrides hashing; a missing size falls back to the shard's
+    recorded ``pack_size``, then to the local file, else :class:`ManifestError` is raised.
+    ``expected_shards`` larger than the number of meta files marks the bundle partial.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -341,6 +379,8 @@ def build_bundle(meta_paths: list[Path], pack_dir: Path | None, out_dir: Path,
     loaded = load_shards(list(meta_paths))
     if loaded.cfg is not None and cfg_hash and loaded.cfg != cfg_hash:
         raise ShardMismatch("shards were scanned with a different cfg than requested")
+    # Resolved first so that a pack of unknown size fails the merge before any real work.
+    pack_files = _pack_entries(loaded, pack_dir, out_dir, pack_hashes)
     tz = mcfg.tz_fallback
 
     paired = pair_all(loaded, tz)
@@ -430,7 +470,7 @@ def build_bundle(meta_paths: list[Path], pack_dir: Path | None, out_dir: Path,
 
     np.save(out_dir / EMB_NAME, emb, allow_pickle=False)
     files = [_file_entry(out_dir, INDEX_NAME), _file_entry(out_dir, EMB_NAME)]
-    files += _pack_entries(loaded, pack_dir, out_dir, pack_hashes)
+    files += pack_files
     manifest = {
         "index_schema": INDEX_SCHEMA, "cfg": cfg_hash, "extract_version": extract_version,
         "code_version": CODE_VERSION, "created_at": created_at, "partial": bool(missing),

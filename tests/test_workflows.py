@@ -20,6 +20,10 @@ import check_repo  # noqa: E402
 
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 PRIVATE_REDIRECT = '3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1'
+MAIN = "github.ref == 'refs/heads/main'"
+# The log upload runs even after a failed step, but never with a token the scope check
+# rejected (the check fails closed: nothing else touches Drive with a wrongly scoped token).
+UPLOAD_IF = "${{ always() && steps.scope.outcome == 'success' }}"
 
 
 # ------------------------------------------------------------------ a tiny YAML reader
@@ -235,7 +239,15 @@ def test_common_safety_rules(name):
         ]
         after = steps[steps.index(decode[0]) + 1]
         assert "ci-scope-check" in after["run"], job_name
-        assert steps[-2]["if"] == "always()" and "ci-upload-logs" in steps[-2]["run"]
+        assert after["id"] == "scope", job_name
+        assert steps[-2]["if"] == UPLOAD_IF and "ci-upload-logs" in steps[-2]["run"]
+        uploads = [s for s in steps if "ci-upload-logs" in s.get("run", "")]
+        assert uploads == [steps[-2]], job_name
+        # Every other step after the scope check needs it to have succeeded (the default).
+        for s in steps[steps.index(after) + 1:-2]:
+            assert "always()" not in str(s.get("if", "")), job_name
+        # A Drive job never runs for a ref other than main (A-4): either its own if: says
+        # so, or it needs a job that does (checked per file below).
         assert steps[-1] == {"name": steps[-1]["name"], "if": "always()",
                              "run": 'rm -rf "$RUNNER_TEMP/rc"'}
         # The secret appears only in the decode step.
@@ -271,8 +283,8 @@ def test_pipeline_job_graph(pipeline):
     _text, doc = pipeline
     jobs = doc["jobs"]
     assert set(jobs) == {"probe", "plan", "pass1", "pass2", "pass3", "merge", "report"}
-    assert jobs["probe"]["if"] == "${{ inputs.mode == 'probe' }}"
-    assert jobs["plan"]["if"] == "${{ inputs.mode != 'probe' }}"
+    assert jobs["probe"]["if"] == f"${{{{ {MAIN} && inputs.mode == 'probe' }}}}"
+    assert jobs["plan"]["if"] == f"${{{{ {MAIN} && inputs.mode != 'probe' }}}}"
     assert jobs["plan"]["environment"] == "photos"
     for n in (1, 2, 3):
         job = jobs[f"pass{n}"]
@@ -295,6 +307,9 @@ def test_pipeline_job_graph(pipeline):
     assert merge["environment"] == "photos"
     report = jobs["report"]
     assert report["needs"] == ["plan", "pass1", "pass2", "pass3", "merge"]
+    # A probe dispatched from another branch still gets a (red) report.
+    assert report["if"] == ("${{ !cancelled() && (inputs.mode != 'probe' || "
+                            "github.ref != 'refs/heads/main') }}")
     assert "environment" not in report
     assert "ci-report" in report["steps"][-1]["run"]
     assert report["env"]["GPCLEAN_QUOTA3"] == "${{ needs.pass3.outputs.quota }}"
@@ -358,10 +373,75 @@ def test_scan_pass_jobs(scan_pass):
     assert any("--group clip" in s.get("run", "") for s in scan["steps"])
     run = [s["run"] for s in scan["steps"] if "ci-scan" in s.get("run", "")][0]
     assert '--worker "$GPCLEAN_WORKER" --of "$GPCLEAN_OF"' in run
+    assert pending["if"] == f"${{{{ {MAIN} }}}}"
     final = jobs["finalize"]
     assert final["needs"] == ["pending", "scan"]
-    assert final["if"] == "${{ !cancelled() }}"
+    assert final["if"] == f"${{{{ !cancelled() && {MAIN} }}}}"
     # When pending itself stops on a quota no worker writes a flag; finalize must know.
     assert final["env"]["GPCLEAN_PENDING_QUOTA"] == "${{ needs.pending.outputs.quota }}"
     assert final["outputs"] == {"done": "${{ steps.finalize.outputs.done }}",
                                 "quota": "${{ steps.finalize.outputs.quota }}"}
+
+
+def _needs(job: dict) -> list[str]:
+    needs = job.get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def _guarded_jobs(jobs: dict) -> set[str]:
+    """Jobs that can run only for refs/heads/main.
+
+    A job is guarded when its own if: checks the ref, or when it needs a guarded job and
+    either has no status function in its if: (then a skipped need skips it too) or its if:
+    requires that need to have run (its result is success, or it set an output; a skipped
+    job sets none).
+    """
+    guarded: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, job in jobs.items():
+            if name in guarded:
+                continue
+            cond = str(job.get("if", ""))
+            ok = MAIN in cond
+            ups = [n for n in _needs(job) if n in guarded]
+            if not ok and ups:
+                if "always()" in cond or "!cancelled()" in cond:
+                    ok = any(re.search(
+                        rf"needs\.{n}\.(result == 'success'|outputs\.\w+ == '\w+')", cond)
+                        for n in ups)
+                else:
+                    ok = True
+            if ok:
+                guarded.add(name)
+                changed = True
+    return guarded
+
+
+def test_every_drive_job_is_guarded_to_main(pipeline, scan_pass):
+    """A dispatch from a feature branch never runs code with the Drive token (A-4)."""
+    for (_text, doc) in (pipeline, scan_pass):
+        jobs = doc["jobs"]
+        guarded = _guarded_jobs(jobs)
+        for name, job in jobs.items():
+            if job.get("environment") == "photos" or "uses" in job:
+                assert name in guarded, name
+    # The reusable workflow's own jobs check the ref too (defence in depth).
+    assert scan_pass[1]["jobs"]["pending"]["if"] == f"${{{{ {MAIN} }}}}"
+    # The guard itself is what the check relies on: dropping it is caught.
+    jobs = dict(pipeline[1]["jobs"])
+    jobs["plan"] = {**jobs["plan"], "if": "${{ inputs.mode != 'probe' }}"}
+    assert "merge" not in _guarded_jobs(jobs) and "pass1" not in _guarded_jobs(jobs)
+
+
+@pytest.mark.parametrize("name", ["pipeline.yml", "scan-pass.yml"])
+def test_log_upload_waits_for_a_good_scope(name):
+    _text, doc = load(name)
+    n = 0
+    for job in step_jobs(doc).values():
+        for step in job["steps"]:
+            if "ci-upload-logs" in step.get("run", ""):
+                assert step["if"] == UPLOAD_IF
+                n += 1
+    assert n == 3

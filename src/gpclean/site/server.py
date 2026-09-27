@@ -24,7 +24,17 @@ Security controls (docs/PLAN.md section 8, design-security W-1..W-13), all enfor
 * W-11 CSV cells that a spreadsheet would treat as a formula are prefixed with ``'``.
 * W-13 Approving every member of a duplicate group is refused; shared, partner-shared and
   favorited items, and members of non-deletable ("possible same item") groups, need
-  ``"override": true`` in that request. The check and the write run under one lock.
+  ``"override": true`` in that request. The check runs as a ``ReviewDB`` guard inside the
+  write transaction (after ``BEGIN IMMEDIATE``), so neither parallel requests nor a second
+  ``gpclean serve`` on the same home can slip an approval in between check and write.
+
+Deletion mode's "safe to day-select" badge (PLAN section 8) is shown for a day only when
+selecting that whole day in Google Photos would select exactly the approved photos: every
+indexed photo of the day is approved, the bundle knows of no library item on that day that is
+missing from the index (``videos_by_day``, which despite its name counts videos AND skipped
+media such as raw files), no photo of the day has an uncertain day, no undated indexed photo
+belongs to that year, and no unindexed item is undated. Each day lists the reasons it is not
+safe (``day_select_blockers``) so the page can say why.
 
 Error responses carry a fixed code such as ``{"error": "bad_param", "param": "limit"}``; raw
 input is never echoed back. Requests are logged to the private log without query strings.
@@ -44,6 +54,7 @@ import re
 import secrets
 import socket
 import socketserver
+import sqlite3
 import sys
 import threading
 import webbrowser
@@ -60,7 +71,7 @@ from gpclean.review_db import DECISIONS, LIST_STATUSES, ReviewDB, strip_unsafe
 from gpclean.schema import JUNK_CATEGORIES
 from gpclean.search import MAX_LIMIT as SEARCH_MAX_LIMIT
 from gpclean.search import SearchParams, SearchUnavailable, search
-from gpclean.takeout.names import parse_media_name
+from gpclean.takeout.names import parse_media_name, year_of_folder
 from gpclean.takeout.sidecar import validate_photos_url
 from gpclean.version import TRASH_DAYS
 
@@ -101,6 +112,10 @@ _ALLOWED_FETCH_SITES = ("same-origin", "none")
 _CSV_DANGEROUS = ("=", "+", "-", "@", "\t", "\r", "\n")
 CSV_COLUMNS = ("item_uid", "filename", "local_date", "local_time", "width", "height",
                "size_bytes", "category", "reason", "proposed_by", "status", "deleted", "url")
+# Reasons a day is not "safe to day-select", in the order the page reports them.
+DAY_BLOCKERS = ("no_indexed_photos", "not_all_approved", "not_indexed_that_day",
+                "day_uncertain", "undated_in_year", "undated_unknown_year",
+                "unindexed_undated")
 # Fields compared between duplicates so the UI can highlight what differs from the keeper.
 _DIFF_FIELDS = ("dims", "size_bytes", "ext", "local_date", "local_time", "filename",
                 "match_conf", "link_conf", "albums_n", "shared", "partner", "favorited")
@@ -310,10 +325,9 @@ class SiteApp:
         static["index.html"] = index.replace(CSRF_PLACEHOLDER, self.csrf_token).encode("utf-8")
         self.static = static
         # W-13's check-then-write must be atomic: ThreadingHTTPServer runs POSTs in parallel,
-        # so two requests approving complementary halves of a dup group could both pass the
-        # check. Only this site ever approves (MCP can only propose), so a process lock
-        # closes the race for one server.
-        self._approve_lock = threading.Lock()
+        # and a second ``gpclean serve`` may run on the same home. The check is therefore a
+        # guard that ReviewDB runs inside its BEGIN IMMEDIATE transaction (see _guard).
+        self._undated: tuple[dict[int, int], int, int] | None = None   # see _undated_counts
         self._text_lock = threading.Lock()
         self._embed_lock = threading.Lock()
         self.text_embedder = _Serialised(text_embedder, self._embed_lock) \
@@ -460,10 +474,54 @@ class SiteApp:
 
     # ------------------------------------------------------------------ GET endpoints
 
+    def _stat_int(self, key: str) -> int | None:
+        """A non-negative integer merge statistic, or None when the bundle does not have it."""
+        rows = self.bundle.fetchall("SELECT value FROM stats WHERE key = ?", (key,))
+        try:
+            v = json.loads(rows[0][0]) if rows else None
+        except (TypeError, ValueError):
+            return None
+        return v if _is_int(v) and v >= 0 else None
+
+    def _undated_counts(self) -> tuple[dict[int, int], int, int]:
+        """(undated indexed photos per year, undated indexed photos of unknown year,
+        library items missing from the index that have no date).
+
+        An undated photo has no place on any day, but Google Photos still shows it somewhere
+        in its year, so no day of that year can be proven complete; one of unknown year (no
+        date and not in a "Photos from YYYY" folder) blocks every day. ``unindexed_undated``
+        is a single bundle-wide count (older bundles: ``videos_undated``, else 0). The bundle
+        is read-only, so this is computed once.
+        """
+        if self._undated is None:
+            by_year: dict[int, int] = {}
+            unknown = 0
+            for r in self.bundle.fetchall(
+                    "SELECT year, folder FROM items WHERE local_date IS NULL"):
+                year = r[0] if _is_int(r[0]) else year_of_folder(r[1] or "")
+                if year is None:
+                    unknown += 1
+                else:
+                    by_year[year] = by_year.get(year, 0) + 1
+            stat = self._stat_int("unindexed_undated")
+            if stat is None:
+                stat = self._stat_int("videos_undated") or 0
+            self._undated = (by_year, unknown, stat)
+        return self._undated
+
     def api_stats(self, q: _Query) -> dict:
         stats = self.bundle.stats()
+        undated_by_year, undated_unknown, unindexed_undated = self._undated_counts()
         return {
-            "bundle": stats, "queue": self.review.counts(), "rev": self.review.rev(),
+            "bundle": stats,
+            # Library items the index has no row for (videos and skipped media such as raw
+            # files): ``bundle.videos`` counts those with a day; this names them clearly.
+            "not_indexed": {"on_a_day": stats.get("videos", 0), "undated": unindexed_undated},
+            # Indexed photos without a date: each blocks day-select for every day of its year.
+            "undated_indexed": {
+                "by_year": {str(y): n for y, n in sorted(undated_by_year.items())},
+                "unknown_year": undated_unknown},
+            "queue": self.review.counts(), "rev": self.review.rev(),
             "batches": self.review.batches(), "trash_days": TRASH_DAYS,
             "text_search": self.text_status, "port": self.port, "bundle_tag": self.bundle_tag,
             "junk_categories": list(JUNK_CATEGORIES), "junk_default_min": JUNK_DEFAULT_MIN,
@@ -511,11 +569,7 @@ class SiteApp:
         decisions = self.review.group_decisions()
         out = [self._group_out(g, decisions) for g in groups]
         # Oversized similarity buckets were never compared (PLAN section 5); say so.
-        rows = self.bundle.fetchall("SELECT value FROM stats WHERE key = 'skipped_buckets'")
-        try:
-            skipped = int(json.loads(rows[0][0])) if rows else 0
-        except (TypeError, ValueError):
-            skipped = 0
+        skipped = self._stat_int("skipped_buckets") or 0
         return {**_page(self.bundle.n_dup_groups(kind), offset, len(out)), "groups": out,
                 "skipped_buckets": skipped}
 
@@ -667,25 +721,57 @@ class SiteApp:
         per_day: dict[str | None, list[dict]] = {}
         for e in rows:
             per_day.setdefault(e["local_date"], []).append(e)
-        videos = self.bundle.videos_by_day()
+        not_indexed = self.bundle.videos_by_day()
         known = self._day_stats([d for d in per_day if d])
         days = []
         for d in dict.fromkeys(it["local_date"] for it in page):
             all_day = per_day[d]
             n_indexed, n_uncertain = known.get(d, (0, 0)) if d else (0, 0)
             n_approved = sum(1 for e in all_day if e["id"] is not None)
-            n_videos = videos.get(d, 0) if d else 0
-            days.append({
+            n_not_indexed = not_indexed.get(d, 0) if d else 0
+            day = {
                 "date": d, "items": [it for it in page if it["local_date"] == d],
                 "n_indexed_photos_that_day": n_indexed, "n_approved_that_day": n_approved,
                 "n_deleted_that_day": sum(1 for e in all_day if e["q"]["deleted"]),
-                "videos_that_day": n_videos, "n_day_uncertain": n_uncertain,
-                "safe_to_day_select": bool(d) and n_indexed > 0 and n_approved == n_indexed
-                and n_videos == 0 and n_uncertain == 0,
-            })
+                # Items of that day missing from the index (videos AND skipped media);
+                # ``videos_that_day`` is the same number under its original, narrower name.
+                "n_not_indexed_that_day": n_not_indexed, "videos_that_day": n_not_indexed,
+                "n_day_uncertain": n_uncertain,
+            }
+            if d:
+                day.update(self._day_blockers(d, day))
+            else:
+                # Undated / missing-from-bundle rows: there is no day to select at all.
+                day.update(safe_to_day_select=False, day_select_blockers=[],
+                           n_undated_in_year=0, n_undated_unknown_year=0,
+                           n_unindexed_undated=0)
+            days.append(day)
         res["days"] = days
         res["n_deleted"] = sum(1 for e in rows if e["q"]["deleted"])
         return res
+
+    def _day_blockers(self, d: str, day: dict) -> dict:
+        """``safe_to_day_select`` for one dated day group, with the reasons it is not safe.
+
+        Returns {"safe_to_day_select", "day_select_blockers" (codes from DAY_BLOCKERS),
+        "n_undated_in_year", "n_undated_unknown_year", "n_unindexed_undated"}.
+        """
+        by_year, unknown_year, unindexed_undated = self._undated_counts()
+        n_undated_year = by_year.get(int(d[:4]), 0)
+        n_indexed = day["n_indexed_photos_that_day"]
+        checks = {
+            "no_indexed_photos": n_indexed == 0,
+            "not_all_approved": n_indexed > 0 and day["n_approved_that_day"] != n_indexed,
+            "not_indexed_that_day": day["n_not_indexed_that_day"] > 0,
+            "day_uncertain": day["n_day_uncertain"] > 0,
+            "undated_in_year": n_undated_year > 0,
+            "undated_unknown_year": unknown_year > 0,
+            "unindexed_undated": unindexed_undated > 0,
+        }
+        blockers = [code for code in DAY_BLOCKERS if checks[code]]
+        return {"safe_to_day_select": not blockers, "day_select_blockers": blockers,
+                "n_undated_in_year": n_undated_year, "n_undated_unknown_year": unknown_year,
+                "n_unindexed_undated": unindexed_undated}
 
     def export_csv(self, q: _Query) -> bytes:
         status = q.enum("status", LIST_STATUSES, "approved")
@@ -715,8 +801,13 @@ class SiteApp:
 
     # ------------------------------------------------------------------ safety checks
 
-    def _whole_group_violations(self, new_uids: set[str], item_ids: list[int]) -> list[int]:
-        """Dup groups whose EVERY member would be approved after approving ``new_uids``."""
+    def _whole_group_violations(self, new_uids: set[str], item_ids: list[int],
+                                conn: sqlite3.Connection | None = None) -> list[int]:
+        """Dup groups whose EVERY member would be approved after approving ``new_uids``.
+
+        ``conn`` is the review DB connection a guard received: the current approvals are then
+        read inside that write transaction.
+        """
         gids = sorted({m["dup_group"] for m in self.bundle.memberships(item_ids).values()
                        if m.get("dup_group") is not None})
         if not gids:
@@ -728,19 +819,19 @@ class SiteApp:
                 f" ON i.item_id = m.item_id WHERE m.group_id IN ({marks})", gids):
             members.setdefault(r[0], set()).add(r[1])
         everyone = sorted(set().union(*members.values()))
-        approved = {u for u, row in self.review.get(everyone).items()
-                    if row["status"] == "approved"} | new_uids
+        approved = self.review.approved_among(everyone, conn) | new_uids
         return [g for g, uids in sorted(members.items()) if uids <= approved]
 
-    def _check_approval(self, items: list[dict], override: bool) -> None:
+    def _check_approval(self, items: list[dict], override: bool,
+                        conn: sqlite3.Connection | None = None) -> None:
         """W-13: refuse whole-group deletion; protected items need an explicit override.
 
         Protected: shared, partner-shared, favorited, or a member of a non-deletable dup
-        group (possibly the same Google Photos item as its duplicate). Callers hold
-        ``_approve_lock`` from this check through the write.
+        group (possibly the same Google Photos item as its duplicate). Raises ApiError(409).
+        Writers run it through :meth:`_guard`, i.e. inside the review DB's write transaction.
         """
         ids = [it["item_id"] for it in items]
-        bad = self._whole_group_violations({it["item_uid"] for it in items}, ids)
+        bad = self._whole_group_violations({it["item_uid"] for it in items}, ids, conn)
         if bad:
             raise ApiError(409, "whole_group", group_ids=bad)
         same = self._possible_same_items(ids)
@@ -749,6 +840,17 @@ class SiteApp:
                      or it["item_id"] in same]
         if protected and not override:
             raise ApiError(409, "needs_override", ids=protected)
+
+    def _guard(self, items: list[dict], override: bool):
+        """A ReviewDB guard running :meth:`_check_approval` inside the write transaction.
+
+        ReviewDB calls it after BEGIN IMMEDIATE, while this process holds the database write
+        lock, so the approvals it reads cannot change (from this or another ``gpclean serve``
+        process) before the approval is committed. Its ApiError rolls the write back.
+        """
+        def guard(conn: sqlite3.Connection) -> None:
+            self._check_approval(items, override, conn)
+        return guard
 
     def _items_for_uids(self, uids: list[str]) -> list[dict]:
         ids = self.bundle.uids_to_ids(uids)
@@ -774,12 +876,11 @@ class SiteApp:
         items = self.bundle.items(ids)
         if len(items) != len(ids):
             raise ApiError(404, "unknown_item")
-        with self._approve_lock:
-            self._check_approval(items, override)
-            try:
-                n = self.review.user_add([(it["item_uid"], reason, category) for it in items])
-            except ValueError:
-                raise ApiError(400, "bad_reason_or_category") from None
+        try:
+            n = self.review.user_add([(it["item_uid"], reason, category) for it in items],
+                                     guard=self._guard(items, override))
+        except ValueError:
+            raise ApiError(400, "bad_reason_or_category") from None
         return {"ok": True, "changed": n, **self._state()}
 
     def post_queue_decide(self, body: dict) -> dict:
@@ -790,9 +891,7 @@ class SiteApp:
         override = _strict_bool(body.get("override", False), "override")
         if decision == "approve":
             items = self._items_for_uids(uids)
-            with self._approve_lock:
-                self._check_approval(items, override)
-                n = self.review.decide(uids, decision)
+            n = self.review.decide(uids, decision, guard=self._guard(items, override))
         else:
             n = self.review.decide(uids, decision)
         return {"ok": True, "changed": n, **self._state()}
@@ -853,10 +952,8 @@ class SiteApp:
             name = strip_unsafe(keeper_item.get("filename") or "")[:DUP_REASON_NAME_MAX]
             reason = f"duplicate of {name or '#' + str(keeper)}"
             todo += [(m, reason) for m in g["members"] if m["item_id"] != keeper]
-        with self._approve_lock:
-            self._check_approval([m for m, _ in todo], override)
-            n = self.review.user_add([(m["item_uid"], reason, "dup_extra")
-                                      for m, reason in todo])
+        n = self.review.user_add([(m["item_uid"], reason, "dup_extra") for m, reason in todo],
+                                 guard=self._guard([m for m, _ in todo], override))
         return {"ok": True, "changed": n, **self._state()}
 
 

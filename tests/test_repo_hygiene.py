@@ -246,6 +246,39 @@ PLANTS = {
     "rclone outside wrapper": ("src/pkg/direct.py",
                                "subprocess.run(['rclone', 'lsjson', 'gp:'])\n",
                                "use gpclean.rclone.Rclone"),
+    # ----- review round 3: flow run:, shell:, containers, RCLONE_* env -----
+    "flow run": (".github/workflows/ci.yml",
+                 _wf_step('- {name: leak, run: "echo ${{ github.event.pull_request.title }}"}'),
+                 "inside run"),
+    "flow run later key": (".github/workflows/ci.yml",
+                           _wf_step("- {name: leak, shell: bash, run: echo ${{ inputs.folder }}}"),
+                           "inside run"),
+    "shell expr": (".github/workflows/ci.yml",
+                   _wf_step('- shell: "${{ github.head_ref }} {0}"\n        run: echo hi'),
+                   "inside shell"),
+    "flow shell expr": (".github/workflows/ci.yml",
+                        _wf_step('- {shell: "${{ inputs.folder }} {0}", run: echo hi}'),
+                        "inside shell"),
+    "run alias": (".github/workflows/ci.yml", _wf_step("- run: *script"), "YAML alias"),
+    "container": (".github/workflows/ci.yml",
+                  GOOD_WORKFLOW.replace("    runs-on: ubuntu-24.04\n",
+                                        "    runs-on: ubuntu-24.04\n    container: evil/image\n"),
+                  "container/services"),
+    "services": (".github/workflows/ci.yml",
+                 GOOD_WORKFLOW.replace("    runs-on: ubuntu-24.04\n",
+                                       "    runs-on: ubuntu-24.04\n    services:\n"
+                                       "      db:\n        image: evil/db\n"),
+                 "container/services"),
+    "flow services": (".github/workflows/ci.yml",
+                      GOOD_WORKFLOW.replace("  test:\n", "  other: {runs-on: x, services: {}}\n"
+                                            "  test:\n"), "container/services"),
+    "RCLONE_DUMP env": (".github/workflows/ci.yml",
+                        GOOD_WORKFLOW.replace("          FOLDER:",
+                                              "          RCLONE_DUMP: headers\n"
+                                              "          FOLDER:"), "RCLONE_* flag"),
+    "RCLONE_DUMP to GITHUB_ENV": (".github/workflows/ci.yml",
+                                  _wf_run('echo "RCLONE_DUMP=headers" >> "$GITHUB_ENV"'),
+                                  "RCLONE_* flag"),
     "netrc": (".netrc", "machine x login y password z\n", "dotfile"),
     "DS_Store": ("photos/.DS_Store", "x\n", "dotfile"),
     "data uri image": ("docs/a.md", "![x](data:image/" + "jpeg;base64,AAAA)\n",
@@ -291,6 +324,16 @@ ALLOWED = [
     # an env: block that follows "- run:" in the same step is not part of the run value
     (".github/workflows/ci.yml", _wf_step(
         "- run: echo \"$X\"\n        env:\n          X: ${{ inputs.folder }}")),
+    # the config file location and the secret that carries it are the allowed RCLONE_* names
+    (".github/workflows/ci.yml", GOOD_WORKFLOW.replace(
+        "          FOLDER:", "          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}\n"
+        "          FOLDER:").replace(
+        "          uv run pytest -q\n",
+        "          uv run pytest -q\n"
+        '          echo "RCLONE_CONFIG=$RUNNER_TEMP/c" >> "$GITHUB_ENV"\n')),
+    # a matrix value in a flow run: and a plain shell: are fine
+    (".github/workflows/ci.yml",
+     _wf_step("- {name: s, shell: bash, run: echo ${{ matrix.shard }}}")),
     (".github/workflows/scan-pass.yml", GOOD_WORKFLOW.replace(
         "  push:\n  pull_request:\n", "  workflow_call:\n    outputs:\n      done:\n"
         "        value: ${{ jobs.test.outputs.done }}\n")),

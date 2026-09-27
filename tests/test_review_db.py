@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -488,3 +489,105 @@ def test_write_error_propagates_when_sqlite_already_rolled_back(db, monkeypatch)
         db._write(fn)
     assert not db._conn.in_transaction
     assert db.propose(items([1]), proposer=CLAUDE, batch_id="b1")["added"] == 1
+
+
+# ---------------------------------------------------------------- write guards
+
+def status_in(conn, n):
+    return conn.execute("SELECT status FROM queue WHERE item_uid = ?", (uid(n),)).fetchone()[0]
+
+
+@pytest.mark.parametrize("method", ["user_add", "decide"])
+def test_guard_runs_inside_the_write_transaction(db, method):
+    db.propose(items([1]), proposer=CLAUDE, batch_id="b1")
+    seen = []
+
+    def guard(conn):
+        # BEGIN IMMEDIATE is open and nothing has been written yet.
+        seen.append((conn.in_transaction, status_in(conn, 1)))
+
+    if method == "user_add":
+        assert db.user_add(items([1]), guard=guard) == 1
+    else:
+        assert db.decide([uid(1)], "approve", guard=guard) == 1
+    assert seen == [(True, "proposed")] and status(db, 1) == "approved"
+
+
+class Refused(Exception):
+    pass
+
+
+@pytest.mark.parametrize("method", ["user_add", "decide"])
+def test_guard_exception_rolls_back_and_propagates(db, method):
+    db.propose(items([1, 2]), proposer=CLAUDE, batch_id="b1")
+    rev, n_events = db.rev(), len(db.events(limit=1000))
+
+    def guard(conn):
+        raise Refused("no")
+
+    with pytest.raises(Refused):
+        if method == "user_add":
+            db.user_add(items([1, 3]), guard=guard)
+        else:
+            db.decide([uid(1), uid(2)], "approve", guard=guard)
+    assert db.rev() == rev and len(db.events(limit=1000)) == n_events
+    assert status(db, 1) == status(db, 2) == "proposed" and db.get([uid(3)]) == {}
+    # The connection is usable again (the transaction was really closed).
+    assert db.user_add(items([3])) == 1
+
+
+def test_guard_must_be_callable(db):
+    with pytest.raises(TypeError):
+        db.user_add(items([1]), guard="not a function")
+    assert db.get([uid(1)]) == {}
+
+
+def test_approved_among(db):
+    db.user_add(items([1, 2]))
+    db.propose(items([3]), proposer=CLAUDE, batch_id="b1")
+    db.mark_deleted([uid(2)], True)
+    want = {uid(1), uid(2)}
+    assert db.approved_among([uid(n) for n in (1, 2, 3, 4)]) == want
+    got = []
+    db.decide([uid(3)], "reject", guard=lambda conn: got.append(
+        db.approved_among([uid(n) for n in (1, 2, 3)], conn)))
+    assert got == [want]
+    with pytest.raises(ValueError):
+        db.approved_among("g:not-a-list")
+
+
+def _guarded_worker(path: str, n: int, barrier, results) -> None:
+    """Child process: approve uid(n) unless its partner (1 <-> 2) is already approved,
+    checking inside the transaction with a slow guard."""
+    with ReviewDB(Path(path)) as d:
+        def guard(conn):
+            time.sleep(0.3)          # the sibling is surely waiting for the write lock now
+            if d.approved_among([uid(1), uid(2)], conn):
+                raise Refused("partner already approved")
+
+        barrier.wait(60)
+        try:
+            d.user_add(items([n]), guard=guard)
+            results.put((n, "ok"))
+        except Refused:
+            results.put((n, "refused"))
+
+
+def test_guard_serialises_two_processes(tmp_path):
+    path = tmp_path / "review.sqlite"
+    ReviewDB(path).close()
+    ctx = multiprocessing.get_context("spawn")
+    for _round in range(2):
+        barrier, results = ctx.Barrier(2), ctx.Queue()
+        procs = [ctx.Process(target=_guarded_worker, args=(str(path), n, barrier, results))
+                 for n in (1, 2)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(120)
+        assert [p.exitcode for p in procs] == [0, 0]
+        got = dict(results.get(timeout=10) for _ in procs)
+        assert sorted(got.values()) == ["ok", "refused"], got
+        with ReviewDB(path) as d:
+            assert len(d.approved_among([uid(1), uid(2)])) == 1
+            d.decide([uid(1), uid(2)], "reset")      # user rows are removed: next round

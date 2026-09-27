@@ -45,6 +45,11 @@ How to read ``expected.json`` (conventions the INTERFACES.md schema leaves open)
 - One photo (C2) is ``archived`` in both exports; ``Trash/`` holds one skipped image. Partner
   sharing and ``trashed: true`` sidecars are not planted.
 - ``videos.by_day`` uses the video sidecar's ``photoTakenTime`` in America/New_York.
+- ``unindexed_by_day`` counts, per local day (same rule), every year-folder library item that
+  gets no index row: the videos plus the skipped ``raw`` / ``other_image`` / ``too_large``
+  media that have a sidecar (one per url). It is what the merge writes to ``videos_by_day``,
+  which the review site checks before it offers "select the whole day". Album copies are not
+  counted (they are copies of year-folder items), so it is the same with or without albums.
 
 Where the PLAN section 11 cases live: P1-P12 in :func:`_plant_positives`, C1-C3 in
 :func:`_plant_collapses`, N1-N6 in :func:`_plant_negatives`, N7 in :func:`_plant_fillers`,
@@ -602,6 +607,10 @@ class _Builder:
         self.bursts: list[dict] = []
         self.videos: list[str] = []
         self.video_days: dict[str, int] = {}
+        # Year-folder library items with no index row (videos + skipped media with a sidecar),
+        # counted once per url on their local day.
+        self.unindexed_days: dict[str, int] = {}
+        self._unindexed_urls: set[str] = set()
         self.skipped: dict[str, str] = {}
         self._urls: set[str] = set()
         self._clock: dict[int, int] = {}
@@ -644,6 +653,29 @@ class _Builder:
 
     def skip(self, zip_name: str, name: str, data: bytes, reason: str) -> None:
         self.skipped[self.add_member(zip_name, name, data)] = reason
+
+    def count_unindexed(self, url_id: str, taken: int) -> None:
+        """Count one library item without an index row on its local day (once per url)."""
+        if url_id in self._unindexed_urls:
+            return
+        self._unindexed_urls.add(url_id)
+        day = datetime.fromtimestamp(taken, TZ).date().isoformat()
+        self.unindexed_days[day] = self.unindexed_days.get(day, 0) + 1
+
+    def add_skipped_media(self, zip_name: str, folder_year: int, filename: str, data: bytes,
+                          reason: str, *, taken: int, created: int, **sidecar) -> None:
+        """A year-folder file the scanner skips (``raw`` / ``other_image`` / ``too_large``)
+        with its sidecar: no index row, yet a library item on its day in Google Photos.
+
+        The sidecar is an orphan for pairing purposes (no image claims it), but the merge
+        still counts the item in ``videos_by_day``, and so does ``unindexed_by_day``.
+        """
+        folder = f"{ROOT}/Photos from {folder_year}"
+        self.skip(zip_name, f"{folder}/{filename}", data, reason)
+        url_id = self.new_url_id()
+        self.add_member(zip_name, f"{folder}/{sidecar_name(filename)}", sidecar_bytes(
+            title=filename, taken=taken, created=created, url_id=url_id, **sidecar))
+        self.count_unindexed(url_id, taken)
 
     # -- items ------------------------------------------------------------------------------
 
@@ -714,14 +746,16 @@ class _Builder:
         member = f"{ROOT}/{folder}/{filename}"
         data = _fake_mp4(self.rng(), 300_000 + self.rand.randrange(0, 200_000))
         mref = self.add_member(zip_name, member, data)
+        url_id = self.new_url_id()
         self.add_member(zip_name, f"{ROOT}/{folder}/{sidecar_name(filename)}", sidecar_bytes(
-            title=filename, taken=taken, created=taken + 7200, url_id=self.new_url_id()))
+            title=filename, taken=taken, created=taken + 7200, url_id=url_id))
         if album:
             self.skipped[mref] = "album_video"
             return
         self.videos.append(mref)
         day = datetime.fromtimestamp(taken, TZ).date().isoformat()
         self.video_days[day] = self.video_days.get(day, 0) + 1
+        self.count_unindexed(url_id, taken)
 
     # -- ground truth -------------------------------------------------------------------------
 
@@ -762,6 +796,7 @@ class _Builder:
             "junk": {k: sorted(it.junk) for k, it in sorted(self.items.items()) if it.junk},
             "videos": {"members": sorted(self.videos),
                        "by_day": dict(sorted(self.video_days.items()))},
+            "unindexed_by_day": dict(sorted(self.unindexed_days.items())),
             "skipped": dict(sorted(self.skipped.items())),
             "n_items": len(self.items),
         }
@@ -1214,11 +1249,9 @@ def _plant_junk(b: _Builder) -> None:
     b.add_photo("raw", 2023, f"{stamp}.RAW-01.MP.COVER.jpg",
                 _jpeg(photo(b.rng(), 2000, 1500), 90, camera_exif(CAM_MAIN, when)),
                 taken=utc_ts(when))
-    dng = f"{stamp}.RAW-02.ORIGINAL.dng"
-    b.skip(ZIP_A2, f"{ROOT}/Photos from 2023/{dng}",
-           b"II*\x00" + b.rng().bytes(40_000), "raw")
-    b.add_member(ZIP_A2, f"{ROOT}/Photos from 2023/{sidecar_name(dng)}", sidecar_bytes(
-        title=dng, taken=utc_ts(when), created=utc_ts(when) + 3600, url_id=b.new_url_id()))
+    b.add_skipped_media(ZIP_A2, 2023, f"{stamp}.RAW-02.ORIGINAL.dng",
+                        b"II*\x00" + b.rng().bytes(40_000), "raw", taken=utc_ts(when),
+                        created=utc_ts(when) + 3600)
 
 
 def _plant_fillers(b: _Builder, n: int) -> None:
@@ -1304,13 +1337,11 @@ def _plant_videos_and_misc(b: _Builder) -> None:
            b"<!doctype html><title>Takeout</title><p>Your data export</p>", "outside_photos")
     b.skip(ZIP_A2, f"{ROOT}/user-generated-memory-titles.json", b'{"titles": []}',
            "non_sidecar_json")
-    # A scanner TIFF: counted and skipped; its sidecar is an orphan.
-    tif = encode(photo(b.rng(), 400, 300, grain=0), "TIFF")
-    b.skip(ZIP_A1, f"{ROOT}/Photos from 2018/scan_0001.tif", tif, "other_image")
-    b.add_member(ZIP_A1, f"{ROOT}/Photos from 2018/{sidecar_name('scan_0001.tif')}",
-                 sidecar_bytes(title="scan_0001.tif", taken=utc_ts(datetime(2018, 3, 3, 12)),
-                               created=utc_ts(datetime(2018, 3, 4, 12)),
-                               url_id=b.new_url_id(), origin=None))
+    # A scanner TIFF: skipped (no index row) but counted on its day; its sidecar is an orphan.
+    b.add_skipped_media(ZIP_A1, 2018, "scan_0001.tif",
+                        encode(photo(b.rng(), 400, 300, grain=0), "TIFF"), "other_image",
+                        taken=utc_ts(datetime(2018, 3, 3, 12)),
+                        created=utc_ts(datetime(2018, 3, 4, 12)), origin=None)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1356,7 +1387,9 @@ def expected_view(expected: dict, *, include_albums: bool) -> dict:
 
     ``expected.json`` describes ``include_albums=true``. Without albums, album photos are
     skipped (``album_media``) instead of being copies; since every one of them is a copy of a
-    year-folder photo, the library items, groups, bursts and junk stay the same.
+    year-folder photo, the library items, groups, bursts and junk stay the same. So do
+    ``videos`` and ``unindexed_by_day``: album videos are ``album_video`` skips either way, and
+    only year-folder media is counted per day.
     """
     out = copy.deepcopy(expected)
     if include_albums:

@@ -1,11 +1,13 @@
 # Renew the Google Drive sign-in and send it to GitHub again.
 #
 # Why: the Google project is in "Testing" mode, so Google ends the sign-in after 7 days.
-# Run this when the last refresh is about 5 days old, before asking Claude for a pipeline
-# run or before downloading a bundle.
+# Run it right before asking Claude for a full pipeline run, and whenever the last refresh
+# is 5 or more days old (also before downloading a bundle).
 #
 # What it does:
-#   1. re-signs in the "gp" Drive connection (a browser window opens; sign in and allow)
+#   1. re-signs in the "gp" Drive connection (a browser window opens; sign in and allow),
+#      and checks that the saved sign-in really changed (answering n to rclone's first
+#      question, "replace it?", renews nothing although rclone reports success)
 #   2. uploads the renewed connection file to GitHub as the secret RCLONE_CONFIG_B64 of the
 #      "photos" environment (piped straight into gh, never shown on screen)
 #   3. reminds you to ask Claude to run the probe, which checks the new sign-in works
@@ -39,13 +41,29 @@ try {
 
     # --- 1. renew the Google sign-in --------------------------------------------------------
     Say "Step 1 of 2: renewing the Google Drive sign-in."
-    Say "A browser window opens. Sign in with the SAME Google account as before,"
-    Say "click Continue on the 'Google hasn't verified this app' page, tick both boxes, and click Continue."
-    Say "If this window asks a question: answer y to 'Use web browser', n to 'Shared Drive'."
+    Say "This window asks three questions. Type the answer and press Enter (just pressing Enter also"
+    Say "picks the right answer each time):"
+    Say "  'Token already configured - replace it?'                          ->  y"
+    Say "  'Use web browser to automatically authenticate rclone with remote?' ->  y"
+    Say "  'Configure this as a Shared Drive (Team Drive)?'                  ->  n"
+    Say "After the second question a browser window opens. Sign in with the SAME Google account as"
+    Say "before, click Continue on the 'Google hasn't verified this app' page, tick both boxes, and"
+    Say "click Continue. The third question comes after the browser says Success."
     Write-Host ""
+    # rclone exits 0 even when "replace it?" was answered n and nothing was renewed, so compare
+    # the token line before and after. Both copies stay in memory and are never printed.
+    $before = (Get-Content -LiteralPath $Conf | Where-Object { $_ -like "token = *" }) -join "`n"
     & rclone config reconnect gp: --config $Conf
-    if ($LASTEXITCODE -ne 0) {
-        throw "The Google sign-in did not finish (exit code $LASTEXITCODE). Run this script again."
+    $code = $LASTEXITCODE
+    $after = (Get-Content -LiteralPath $Conf | Where-Object { $_ -like "token = *" }) -join "`n"
+    $renewed = [bool]$after -and ($after -ne $before)
+    $before = $null
+    $after = $null
+    if ($code -ne 0) {
+        throw "The Google sign-in did not finish (exit code $code). Run this script again."
+    }
+    if (-not $renewed) {
+        throw "The sign-in was NOT renewed (answer y to 'Token already configured - replace it?'). Run this script again."
     }
 
     # --- 2. upload to GitHub ----------------------------------------------------------------
@@ -60,8 +78,8 @@ try {
     }
 
     Write-Host ""
-    Write-Host "ALL DONE. The sign-in is renewed until about $((Get-Date).AddDays(7).ToString('ddd MMM d'))." -ForegroundColor Green
-    Write-Host "Last step: tell Claude 'I refreshed the secret, please run the probe'."
+    Write-Host "ALL DONE. The sign-in is renewed until about $((Get-Date).AddDays(7).ToString('ddd MMM d')). Write that date down." -ForegroundColor Green
+    Write-Host "Last step: tell Claude in the project chat 'I refreshed the secret, please run the probe'."
     Write-Host "Claude starts a quick check; a green 'scope check' step confirms that GitHub can use"
     Write-Host "the new sign-in (and only with the two allowed permissions)."
     exit 0

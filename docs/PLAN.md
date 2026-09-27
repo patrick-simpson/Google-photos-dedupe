@@ -94,14 +94,18 @@ Windows: rclone copy bundle → C:\gpclean\bundle\<cfg>-<stamp>\ → `gpclean se
 ## 1. Repo layout, dependencies, and Windows layout
 ```
 pyproject.toml  uv.lock  .python-version(3.12)  .gitignore(default-deny)  README.md  LICENSE
-docs/MCP_GUIDE.md  docs/SETUP_WINDOWS.md
-.github/workflows/ci.yml  pipeline.yml  scan-pass.yml
-tools/install_tools.sh (uv + rclone, pinned SHA-256)  tools/check_repo.py (hygiene + workflow lint + rclone-verb denylist)
-tools/refresh-secret.ps1 (reconnect → re-upload secret → scope check)
+docs/PLAN.md  docs/INTERFACES.md  docs/SETUP_WINDOWS.md  docs/GITHUB_SETTINGS.md  docs/MCP_GUIDE.md
+.github/workflows/ci.yml  pipeline.yml  scan-pass.yml   .githooks/pre-commit (runs check_repo.py)
+tools/install_tools.sh (uv + rclone, pinned SHA-256)  tools/install_uv.ps1 (uv on Windows CI and the PC, pinned SHA-256)
+tools/check_repo.py (hygiene + workflow lint + rclone-verb denylist)
+tools/setup-windows.ps1 (winget tools → private C:\gpclean → clone/pull → pinned uv → uv sync → fetch-model; re-run = update)
+tools/get-bundle.ps1 (newest non-selftest bundle → rclone copy of the manifest's files → verify-bundle → init)
+tools/refresh-secret.ps1 (reconnect → re-upload secret; the next run's scope check confirms it)
 src/gpclean/ cli.py version.py(EXTRACT_VERSION, INDEX_SCHEMA, TRASH_DAYS) config.py publiclog.py rclone.py store.py
   takeout/{rangefile,zipsource,members,names,sidecar}.py  imaging/{decode,fingerprint,features,thumbs}.py  clipmodel.py
-  scan.py  merge/{load,pairing,collapse,group,bursts,scores,localtime,bundle}.py
-  bundle_read.py review_db.py sheet.py mcp_server.py site/{server.py,static/*} probe.py fixtures/generate.py
+  scan.py scanworker.py  merge/{load,pairing,collapse,group,bursts,scores,localtime,bundle}.py
+  bundle_read.py search.py review_db.py sheet.py mcp_server.py site/{server.py,static/*} localinit.py
+  ci.py probe.py fixtures/generate.py
 tests/…
 ```
 
@@ -109,13 +113,14 @@ tests/…
 
 | Group | Contents |
 |---|---|
-| core | `pillow==12.3.0`, `pillow-heif==1.8.0`, `numpy==2.5.3`, `tzdata` |
-| `pipeline` (runner) | `torch==2.14.0` (+ torchvision), `open_clip_torch==3.3.0`. On Linux, from the explicit, marker-scoped `download.pytorch.org/whl/cpu` index. |
-| `local` (Windows) | `mcp==2.2.0`, plus torch and open_clip for text queries and local `run-local` embedding |
-| `dev` | `pytest` |
+| core | `pillow==12.3.0`, `pillow-heif==1.8.0`, `numpy==2.5.3`, `tzdata==2026.4` |
+| `clip` (runner scan/probe jobs and Windows) | `torch==2.14.0` (+ `torchvision==0.29.0`), `open_clip_torch==3.3.0`. On Linux, from the explicit, marker-scoped `download.pytorch.org/whl/cpu` index. |
+| `mcp` (Windows and CI tests) | `mcp==2.2.0` |
+| `dev` | `pytest==9.1.1` |
 
+- Installs: Windows `uv sync --locked --group clip --group mcp` (text queries and local `run-local` embedding); CI tests `uv sync --locked --group dev --group mcp`; pipeline jobs `uv sync --locked --no-dev`, plus `--group clip` for `probe` and `scan`.
 - `mcp` is never installed in the job that holds Drive tokens.
-- **CLI:** `run-local --zips DIR --out DIR [--include-albums] [--threshold 3] [--no-clip] [--workers N]`. Its output is a full bundle that `serve`, `mcp`, and `verify-bundle` accept. Other commands: `regroup --threshold N`, `fixtures`, `fetch-model`, `verify-bundle`, `init`, `serve`, `mcp`, `mcp-config`, `ci-plan`, `ci-pending`, `ci-scan --worker W --of N`, `ci-finalize`, `ci-merge`, `probe`, `selftest-upload`.
+- **CLI:** `run-local --zips DIR --out DIR [--include-albums] [--threshold 3] [--clip-model b32|b16|none] [--no-clip] [--workers N] [--photos-per-shard 1000]`. Its output is a full bundle that `serve`, `mcp`, and `verify-bundle` accept. Other commands: `regroup --bundle DIR --threshold N`, `fixtures --out DIR [--seed N] [--small]`, `fetch-model [--model b32|b16]`, `verify-bundle DIR`, `init --home DIR --bundle DIR`, `serve --home DIR [--port 8765] [--no-browser]`, `mcp --home DIR`, `mcp-config --home DIR`, `ci-scope-check`, `ci-plan`, `ci-pending`, `ci-scan --worker W --of N`, `ci-finalize`, `ci-merge`, `ci-report`, `ci-upload-logs`, `probe`, `selftest-upload`.
 - **Actions:** only `actions/checkout`, pinned by full SHA (checked against its tag), with `persist-credentials: false`. uv installs Python and verifies its hash. Each job re-downloads the public wheels and weights, which takes about 1–2 minutes.
 - **CLIP weights** come from Hugging Face, pinned by commit plus a SHA-256 of the `.safetensors` file. `HF_HUB_OFFLINE=1` is set at runtime.
 - **Windows layout:**
@@ -130,7 +135,7 @@ tests/…
 ### ci.yml
 - Triggers: `push` and `pull_request`, never `pull_request_target`. `permissions: contents: read`.
 - Matrix: `ubuntu-24.04` and `windows-2025`.
-- Steps: `tools/check_repo.py`, then `uv sync --locked --group dev`, then `pytest`.
+- Steps: install the pinned uv (`tools/install_tools.sh --rclone` on Linux, `tools/install_uv.ps1` on Windows), then `uv sync --locked --group dev --group mcp`, then `tools/check_repo.py`, then `pytest`.
 - Tests include:
   - the fixture end-to-end with `--no-clip`
   - the spawn pool on Windows
@@ -146,7 +151,7 @@ tests/…
   - `include_albums`: bool, default false
   - `mode`: `full | probe | merge_only | selftest`
   - `clip_model`: `b32 | b16 | none`, default b32
-  - `workers`: default 6
+  - `workers`: choice 1–8, default 6
 - **Jobs:**
   1. **`plan`** (`environment: photos`)
      - Refresh the token, run the scope check, and pre-create the whole Drive folder tree for this `cfg`/run, because Drive allows duplicate folder names and parallel `mkdir` calls would race.
@@ -180,14 +185,14 @@ tests/…
      - The next dispatch resumes the work; Claude re-dispatches after the reset.
 - **Modes:**
   - `probe`: one job, described below.
-  - `selftest`: uploads the fixture zips to `gpclean-output/selftest/` and runs the full chain with shards of 25. It deliberately fails one shard in pass 1 through a test-only env flag, which proves pass 2 picks it up.
+  - `selftest`: uploads the fixture zips to `gpclean-output/selftest/` and runs the full chain with shards of 10 photos (8 shards from the three small fixture zips, so shards start mid-zip). It deliberately fails one shard in pass 1 through a test-only env flag, which proves pass 2 picks it up. Its bundle's manifest says `"mode": "selftest"`, and `tools/get-bundle.ps1` never downloads it.
   - `merge_only`: skips scanning, for example to change the threshold.
 - **Drive layout under `gp:gpclean-output/`:**
-  - `state/<cfg>/shards.json`
-  - `work/<cfg>/<zipkey>/<shard>.meta.sqlite`
-  - `bundle/<cfg>/thumbs/<zipkey>-<shard>.sqlite`
+  - `state/<cfg>/shards.json` (plus `quota-<run>-<attempt>-p<pass>-w<worker>.flag` markers)
+  - `work/<cfg>/<zipkey>/<shard:04d>.meta.sqlite`
+  - `bundle/<cfg>/thumbs/<zipkey>-<shard:04d>.sqlite`
   - `bundle/<cfg>/{index.sqlite, embeddings.f16.npy, manifest.json}`
-  - `logs/<run_id>-<attempt>/`
+  - `logs/<run_id>-<attempt>/<job>/` (one folder per job)
   - `probe/<run_id>/`
   - `selftest/`
 - **Keys:**
@@ -195,8 +200,8 @@ tests/…
   - `cfg` hashes `EXTRACT_VERSION` (a hand-bumped constant, not the git SHA), `include_albums`, `clip_model`, and the thumbnail settings.
   - The merge refuses to mix different `cfg` values.
   - SQLite files are written with `journal_mode=DELETE`, run through `VACUUM`, and closed before upload.
-  - Each shard computes its pack's SHA-256 and stores it in the meta file. The merge copies those hashes into the manifest and cross-checks Drive's `md5Checksum`, so it never re-downloads the packs.
-- **Probe (`mode=probe`, 60 min).** Public output is aggregates only; details go to `probe/<run>/probe.json` and `urls-sample.txt`. It records:
+  - Each shard computes its pack's SHA-256 and MD5 and stores them in the meta file. The merge copies the SHA-256 into the manifest and cross-checks the MD5 against Drive's `md5Checksum`, so it never re-downloads the packs.
+- **Probe (`mode=probe`, a 60-minute job with a 50-minute internal budget).** Public output is aggregates only; details go to `probe/<run>/probe.json` and `urls-sample.txt`. It records:
   - nproc, RAM, `df`, CPU flags
   - auth and scope OK; output folder write and readback
   - zip count, GB, and export_ids
@@ -222,7 +227,7 @@ tests/…
   - Socket timeout 60 s. Retries 5 times with backoff from the current offset. zipfile's CRC check catches corruption.
   - A test asserts **zero video bytes read**, discards included.
 - **Workers:**
-  - A `spawn` pool of `nproc` processes on both Windows and Linux.
+  - A `spawn` pool (`scan.ScanPool`) of `nproc` processes on both Windows and Linux, kept for the whole job so each process loads CLIP once. `run-local --workers 0` caps it at 4 processes and one per 3 GB of RAM when CLIP is on.
   - The initializer registers pillow-heif, sets pixel limits, sets `torch.set_num_threads(1)` and `OMP_NUM_THREADS=1`, loads the CLIP image tower, and opens one lazy `ZipSource` per zip.
   - A task is about 32–48 consecutive wanted members (photos plus interleaved JSON). CLIP runs batched per task. `maxtasksperchild` is about 1000.
   - Members over 200 MB are skipped. `DecompressionBombError` and `OSError` are caught per item and logged with the exception type only.
@@ -233,7 +238,7 @@ tests/…
   - `items_raw`: member, folder, filename, ext, format, file_size, crc32, sha256, width and height after rotation, orientation, phash64, **sig** (32×32 luma + 8×8 Cb/Cr = 1,152 B), EXIF (DateTimeOriginal, offset, subsec, make, model, GPS), `has_camera_exif`, `lap_var`, luma mean/std/p02/p98, `frac_dark`, `frac_bright`, `flat_frac`, colorfulness, `emb` (512×f16), `err`
   - `sidecars_raw`: member, folder, json_name, kind (photo, video, or album), title, taken_ts, creation_ts, geo, geo_exif, url, description, people, origin_folder, device_type, from_shared_album, from_partner, favorited, archived, trashed, raw
   - `videos_raw`: member name and size from the central directory only
-  - `shard_info`: counts, bytes_read, pack SHA-256
+  - `shard_info`: counts, bytes_read, pack SHA-256 and MD5
 - **Thumb pack:** `t(member_idx PK, g BLOB 160 px WebP q70, p BLOB 640 px WebP q75)`, with no metadata inside the images.
 - **Bundle `index.sqlite`** (local copy opened `mode=ro&immutable=1`):
   - `meta`, `zips`
@@ -355,7 +360,8 @@ Scores run 0..1 and are never verdicts. Continuous signals are ECDF percentiles 
   - Preset chips: receipt, whiteboard, meme, parking spot, chat screenshot, document.
 - `--no-clip` exists for CI and quick dry runs.
 
-## 7. MCP server (`gpclean mcp --home C:\gpclean`, FastMCP over stdio)
+## 7. MCP server (`gpclean mcp --home C:\gpclean`, the MCP SDK's `MCPServer` over stdio)
+The `mcp` 2.x SDK renamed `FastMCP` to `MCPServer` (`mcp.server.mcpserver`); `build_server` returns one.
 **Server rules:**
 - It never listens on the network; a test enforces this.
 - Logs go to stderr and a rotating file, never stdout.
@@ -384,7 +390,7 @@ Scores run 0..1 and are never verdicts. Continuous signals are ECDF percentiles 
 Read-only tools carry `readOnlyHint`.
 
 **Setup:** `gpclean mcp-config` prints paste-ready snippets.
-- **Claude Code**, run inside `C:\gpclean\review`: `claude mcp add gpclean --scope local -e HF_HUB_OFFLINE=1 -- "C:\gpclean\app\.venv\Scripts\gpclean.exe" mcp --home C:\gpclean`. CLIP loads lazily, so startup is fast. `MCP_TIMEOUT` and `MAX_MCP_OUTPUT_TOKENS` get set only if the M8 smoke test shows they're needed.
+- **Claude Code**, run inside `C:\gpclean\review`: `claude mcp add gpclean --scope local -e HF_HUB_OFFLINE=1 -- 'C:\gpclean\app\.venv\Scripts\gpclean.exe' mcp --home 'C:\gpclean'`. CLIP loads lazily, so startup is fast. `MCP_TIMEOUT` and `MAX_MCP_OUTPUT_TOKENS` get set only if the M8 smoke test shows they're needed.
 - **Claude Desktop:** the `mcpServers.gpclean` JSON block, with the same command and args and escaped backslashes. Open it via Settings → Developer → Edit Config.
 - **`docs/MCP_GUIDE.md`** example requests:
   - "stats"
@@ -429,7 +435,7 @@ Read-only tools carry `readOnlyHint`.
 - **CSV** columns `item_uid, filename, local_date, local_time, width, height, size_bytes, category, reason, proposed_by, status, deleted, url`, with formulas neutralized.
 
 ## 9. Security and privacy controls (mandatory)
-**GitHub settings** (a README checklist; you apply them at M6):
+**GitHub settings** (a checklist in `docs/GITHUB_SETTINGS.md`, linked from the README; you apply them at M6):
 - Environment `photos`: deployment branches = `main` only. It holds the secret `RCLONE_CONFIG_B64`; there are no repository secrets.
 - Default `GITHUB_TOKEN` is read-only, and "Actions can create PRs" is off.
 - Fork-PR workflows need approval for all outside contributors.
@@ -441,7 +447,7 @@ Read-only tools carry `readOnlyHint`.
 **`check_repo.py` lint** fails CI when:
 - any action other than `actions/checkout@<40-hex>` is used;
 - a trigger falls outside push, pull_request (CI only), workflow_dispatch, or workflow_call;
-- `${{ inputs|secrets|github.event }}` appears inside a `run:` block;
+- any `${{ }}` expression (other than a bare `${{ matrix.x }}`) appears inside a `run:` block;
 - top-level `permissions: {}` is missing, or `id-token`, cache, artifacts, `set -x`, or `--dump` appears;
 - a forbidden rclone verb appears (see Drive below).
 
@@ -469,7 +475,8 @@ The README warns: never use "re-run with debug logging".
 - uv and rclone install from official release files with hard-coded SHA-256s. rclone's hash comes from its PGP-signed SHA256SUMS at pin time.
 - Hashed lockfile, wheels only, an explicit PyTorch index, and pinned Hugging Face weights.
 - No pickle anywhere.
-- On Windows: `winget install Rclone.Rclone --version 1.75.1`.
+- On Windows: `winget install Rclone.Rclone --version 1.75.1`; uv 0.8.24 from `tools\install_uv.ps1` (hash-pinned) into `C:\gpclean\bin`, never from winget (a uv outside the 0.8 series fetches an unhashed `uv-build` from PyPI to build the project).
+- `setup-windows.ps1` makes `C:\gpclean` private to the user (icacls: inheritance removed; the user, SYSTEM and Administrators only, by SID), since the default `C:\` ACL lets other accounts read the Drive key and modify the programs Claude runs.
 
 **Repo hygiene:**
 - A default-deny `.gitignore`.
@@ -482,6 +489,8 @@ The README warns: never use "re-run with debug logging".
 - Turn off other connectors in Desktop review chats.
 
 ## 10. README contents
+The README keeps the overview, the cleanup order, the teardown checklist and the privacy notes; the click-by-click steps below live in `docs/SETUP_WINDOWS.md` (parts A–F), `docs/GITHUB_SETTINGS.md` and `docs/MCP_GUIDE.md`.
+
 **0. Prerequisites**
 - Free Drive space ≥ the export size + ~6 GB.
 - Export as `.zip`, never `.tgz`.
@@ -491,43 +500,44 @@ The README warns: never use "re-run with debug logging".
 2. In Google Auth Platform: Branding, then Audience (External, Testing, you as the only test user), then Data access (`drive.readonly` and `drive.file`).
 3. Create a Desktop client.
 4. Expect the "Google hasn't verified this app" screen.
-5. Tokens die after 7 days. Run `tools\refresh-secret.ps1` if one is older than about 5 days before a run or a download. drive.file access survives re-auth with the **same** client.
+5. Tokens die after 7 days. Run `tools\refresh-secret.ps1` right before a full run, and whenever one is 5+ days old before a run or a download (it fails loudly if rclone's "replace it?" was answered n and the token did not change). drive.file access survives re-auth with the **same** client.
 6. Never create `gpclean-output` by hand.
 
 **2. Windows**
-1. `winget install astral-sh.uv Git.Git GitHub.cli` and `winget install Rclone.Rclone --version 1.75.1`.
-2. `git clone … C:\gpclean\app`, then `cd C:\gpclean\app`, then `uv sync --locked --group local`, then `uv run gpclean fetch-model`.
+1. `winget install Git.Git GitHub.cli` and `winget install Rclone.Rclone --version 1.75.1` (64-bit Intel/AMD only; the lock has no Windows ARM64 environment).
+2. `git clone … C:\gpclean\app`, then the hash-pinned uv 0.8.24 via `tools\install_uv.ps1 -Dest C:\gpclean\bin` (first on the user PATH), then `cd C:\gpclean\app`, then `uv sync --locked --group clip --group mcp`, then `uv run gpclean fetch-model --model b32`. (`tools\setup-windows.ps1` does steps 1–2 and makes `C:\gpclean` private; running it again updates the app.)
 3. `rclone config create gp drive client_id=… client_secret=… scope=drive.readonly,drive.file --config C:\gpclean\ci-rclone.conf` (browser consent). **Every local rclone command passes `--config C:\gpclean\ci-rclone.conf`.**
 4. Canary: create a file in the Drive web UI. `rclone deletefile` on it must fail with 403.
 5. `gh auth login`, then create the environment and branch policy (`gh api -X PUT repos/patrick-simpson/Google-photos-dedupe/environments/photos …`), then `[Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\gpclean\ci-rclone.conf")) | gh secret set RCLONE_CONFIG_B64 --env photos --repo patrick-simpson/Google-photos-dedupe`.
 6. Apply the §9 checklist.
 
 **3. Takeout**
-1. Test export: "Photos from 20XX" ×1–2 plus one album. When it lands, **rename the Drive folder to `Takeout-test`**.
+1. First rename any existing Drive `Takeout` folder to `Takeout-old` (Add to Drive reuses the name, and every zip in the folder is processed). Test export: "Photos from 20XX" ×1–2 plus one album. When it lands, **rename the Drive folder to `Takeout-test`**.
 2. Then request the full export: Google Photos only, `.zip`, 50 GB parts, Add to Drive.
 
 **4. Run and review**
-1. Claude runs the probe, then `full` on `Takeout-test` with `include_albums=true`, then on `Takeout`.
+1. Claude (the project chat: Claude Code on the web, on this repo) runs the probe, then `full` on `Takeout-test` with `include_albums=true`, then on `Takeout`. Its "bundle is ready" message names the bundle's cfg, so the user can pass `-Cfg <cfg>` to get-bundle. The photo-review chat (MCP) can't run anything.
 2. `rclone copy gp:gpclean-output/bundle/<cfg> C:\gpclean\bundle\<cfg>-<stamp> -P --config …`. **Copy, never sync.**
-3. `gpclean verify-bundle` and `gpclean init --bundle …`. `init` also creates `C:\gpclean\review\.claude\settings.json`.
-4. `gpclean serve`.
+3. `gpclean verify-bundle <dir>` and `gpclean init --home C:\gpclean --bundle <dir>`. `init` also creates `C:\gpclean\review\.claude\settings.json` and `CLAUDE.md`. (`tools\get-bundle.ps1` does steps 2–3 for the newest bundle that is not a selftest: a manifest with `mode: selftest`, or a `shards.json` listing a zip from `gpclean-output/selftest/`. It downloads only the files the manifest lists, manifest last.)
+4. `gpclean serve --home C:\gpclean`.
 5. Set up MCP for Claude Code and Desktop (from `gpclean mcp-config`); see MCP_GUIDE.
 6. Spot-check 30 duplicate groups by eye.
 
 **5. Cleanup order**
-- a) The Takeout export is your only full-quality copy.
-- b) Review, then delete in Google Photos. Trash keeps items **30 days**.
-- **e) Decide on an offline copy. If you keep one, download it and verify it (`python -m zipfile -t` per part).**
-- c) Storage saver: photos.google.com → Settings → Manage storage → Recover storage → Convert. Irreversible; documented only.
-- d) Switch backup quality to Storage saver on all devices.
+1. The Takeout export is your only full-quality copy.
+2. Review, then delete in Google Photos. Trash keeps items **30 days**.
+3. **Decide on an offline copy. If you keep one, download it and verify it (`python -m zipfile -t` per part).**
+4. Storage saver: photos.google.com → Settings → Manage storage → Recover storage → Convert. Irreversible; documented only.
+5. Switch backup quality to Storage saver on all devices.
 
 **6. Teardown**
 - Delete `Takeout`, `Takeout-test`, and `gpclean-output`, then empty the Drive trash.
 - Revoke the app at myaccount.google.com/connections and delete the Cloud project.
 - Delete the `photos` environment and its secret, delete workflow runs, and `gh auth logout`.
-- `claude mcp remove gpclean` and remove the Desktop config entry.
+- Revoke GitHub CLI at github.com/settings/applications (logout alone does not).
+- `claude mcp remove gpclean`, remove the Desktop config entry, and delete Claude Desktop's `mcp-server-gpclean*.log` files.
 - Delete the review chats and `%USERPROFILE%\.claude\projects\<review>`.
-- Delete `C:\gpclean`. Optionally delete the repo.
+- Delete `C:\gpclean`, `%APPDATA%\uv` (uv's Python) and the PowerShell history (it holds the `rclone config create` line with the client secret). Optionally uninstall the winget tools and delete the repo.
 
 ## 11. Fixtures and tests
 `gpclean fixtures` builds seeded procedural images (fractal noise, shapes, rendered text) into 3 zips across 2 exports, plus `expected.json`. Members are a mix of stored and deflated, with one forced ZIP64 member.

@@ -3,8 +3,8 @@
 The fixture test runs the real fixture zips through a tiny scanner stand-in
 (``shard_factory.shards_from_zips``) and demands an exact match with ``expected.json``:
 every planted duplicate found with its keeper, nothing else grouped, collapses, pairings,
-bursts, the exhaustive junk categories and the per-day video counts. A second copy of the
-check runs through the real ``gpclean.scan`` once it exists.
+bursts, the exhaustive junk categories and the per-day counts of unindexed library items
+(``unindexed_by_day``). A second copy of the check runs through the real ``gpclean.scan``.
 """
 
 from __future__ import annotations
@@ -12,8 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-import zipfile
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -29,11 +27,14 @@ from shard_factory import (
 from gpclean.bundle_read import Bundle
 from gpclean.config import MergeConfig
 from gpclean.fixtures.generate import expected_view, generate
-from gpclean.merge.bundle import analyse, build_bundle, cli_regroup, regroup
-from gpclean.merge.load import UNINDEXED_SKIP_REASONS, ShardMismatch
-from gpclean.merge.localtime import video_day
-from gpclean.takeout.names import year_of_folder
-from gpclean.takeout.sidecar import parse_sidecar
+from gpclean.merge.bundle import (
+    ManifestError,
+    analyse,
+    build_bundle,
+    cli_regroup,
+    regroup,
+)
+from gpclean.merge.load import ShardMismatch
 
 EXHAUSTIVE = ("screenshot", "messaging", "tiny", "dup_extra", "burst_extra")
 PIXEL_CATS = ("blur", "dark", "overexposed", "pocket")
@@ -112,40 +113,15 @@ def check_against_expected(bundle_dir: Path, exp: dict) -> None:
             want = {k for k, cats in exp["junk"].items() if cat in cats}
             assert want <= flagged.get(cat, set()), cat
 
-        assert b.videos_by_day() == exp["videos"]["by_day"]
+        # videos_by_day counts every unindexed year-folder library item (videos plus skipped
+        # raw / other-format media with a sidecar), which is what unindexed_by_day records.
+        assert b.videos_by_day() == exp["unindexed_by_day"]
+        assert sum(exp["unindexed_by_day"].values()) > sum(exp["videos"]["by_day"].values())
         stats = b.stats()
         assert stats["skipped_buckets"] == 0
         assert stats["items"] == exp["n_items"]
     finally:
         b.close()
-
-
-def with_unindexed_media(zip_dir: Path, exp: dict, tz: str = "America/New_York") -> dict:
-    """``exp`` with the planted raw / other-format files counted in ``videos.by_day``.
-
-    The merge counts every year-folder library item that has no index row on its day (the
-    site's whole-day selection must not hide it), but expected.json counts videos only. Until
-    the fixture records these itself, derive them here, independently of the merge's pairing:
-    the sidecar in the same folder whose title is the file's name gives the url and the time.
-    """
-    extra: Counter = Counter()
-    seen: set[str] = set()
-    for mref, reason in exp["skipped"].items():
-        zip_name, member = mref.split("::", 1)
-        folder, filename = member.split("/")[-2:]
-        if reason not in UNINDEXED_SKIP_REASONS or year_of_folder(folder) is None:
-            continue
-        with zipfile.ZipFile(Path(zip_dir) / zip_name) as zf:
-            for name in zf.namelist():
-                if not name.endswith(".json") or name.split("/")[-2:-1] != [folder]:
-                    continue
-                sc = parse_sidecar(zf.read(name))
-                if sc.get("title") == filename and sc.get("url") not in seen:
-                    seen.add(sc["url"])
-                    extra[video_day(sc["taken_ts"], tz)] += 1
-    assert extra, "the fixture plants a .tif and a .dng with sidecars"
-    by_day = Counter(exp["videos"]["by_day"]) + extra
-    return {**exp, "videos": {**exp["videos"], "by_day": dict(sorted(by_day.items()))}}
 
 
 @pytest.fixture(scope="module")
@@ -164,8 +140,7 @@ def test_fixture_end_to_end_via_stand_in_scanner(fixture_zips, tmp_path, include
     manifest = build_bundle(metas, pack_dir, out, MergeConfig(), cfg_hash="testcfg000",
                             clip_model="none")
     assert not manifest["partial"]
-    check_against_expected(out, with_unindexed_media(
-        zips, expected_view(expected, include_albums=include_albums)))
+    check_against_expected(out, expected_view(expected, include_albums=include_albums))
 
 
 @pytest.fixture(scope="module")
@@ -192,8 +167,7 @@ def test_full_fixture_end_to_end_at_every_threshold(full_fixture_scans, tmp_path
     out = tmp_path / "bundle"
     build_bundle(metas, pack_dir, out, MergeConfig(threshold=threshold), cfg_hash="testcfg000",
                  clip_model="none")
-    check_against_expected(out, with_unindexed_media(
-        zips, expected_view(expected, include_albums=include_albums)))
+    check_against_expected(out, expected_view(expected, include_albums=include_albums))
 
 
 @pytest.mark.slow
@@ -205,8 +179,7 @@ def test_fixture_end_to_end_via_scan(fixture_zips, tmp_path):
     rc = scan.cli_run_local(zips=zips, out=out, include_albums=False, threshold=3,
                             clip_model="none", no_clip=True, workers=1, photos_per_shard=1000)
     assert rc == 0
-    check_against_expected(out, with_unindexed_media(
-        zips, expected_view(expected, include_albums=False)))
+    check_against_expected(out, expected_view(expected, include_albums=False))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -396,6 +369,54 @@ def test_pack_hash_from_shard_info_when_pack_is_remote(tmp_path):
     thumbs = [f for f in manifest["files"] if f["path"].startswith("thumbs/")]
     assert thumbs == [{"path": f"thumbs/{w.pack_name}", "size": 999, "sha256": "cd" * 32}]
     assert np.load(tmp_path / "out" / "embeddings.f16.npy", allow_pickle=False).shape == (0, 512)
+
+
+def test_given_pack_hash_without_size_uses_shard_info_then_local_file(synthetic, tmp_path):
+    """A caller that knows the hash but not the size (ci passes ``size: None``) still gets an
+    int size: the shard's recorded pack_size, else the local file's."""
+    facts = synthetic[2]
+    local = (synthetic[1] / facts["pack_a"]).stat().st_size
+    _out, manifest, _f = _build(synthetic, tmp_path, pack_hashes={
+        facts["pack_a"]: {"sha256": "ef" * 32, "size": None}})
+    entry = next(f for f in manifest["files"] if f["path"] == f"thumbs/{facts['pack_a']}")
+    assert entry == {"path": f"thumbs/{facts['pack_a']}", "size": local, "sha256": "ef" * 32}
+    assert all(type(f["size"]) is int for f in manifest["files"])
+
+
+def test_pack_size_from_shard_info_when_caller_gives_none(tmp_path):
+    w = ShardWriter(tmp_path / "a.sqlite", zip_name=ZIP_A,
+                    extra_info={"pack_sha256": "cd" * 32, "pack_size": "999"})
+    w.image("IMG_1.jpg", image_cols(textured(5)))
+    manifest = build_bundle([w.close()], None, tmp_path / "out", MergeConfig(),
+                            cfg_hash="testcfg000", clip_model="none",
+                            pack_hashes={w.pack_name: {"sha256": "cd" * 32, "size": None}})
+    thumbs = [f for f in manifest["files"] if f["path"].startswith("thumbs/")]
+    assert thumbs == [{"path": f"thumbs/{w.pack_name}", "size": 999, "sha256": "cd" * 32}]
+
+
+@pytest.mark.parametrize("via", ["shard_info", "pack_hashes"])
+def test_pack_of_unknown_size_fails_the_merge(tmp_path, via):
+    """A remote pack whose size nobody recorded must not get a ``size: null`` entry: the merge
+    fails before writing anything, and no manifest vouches for the folder."""
+    extra = {"pack_sha256": "cd" * 32} if via == "shard_info" else {}
+    w = ShardWriter(tmp_path / "a.sqlite", zip_name=ZIP_A, extra_info=extra)
+    w.image("IMG_1.jpg", image_cols(textured(5)))
+    hashes = {w.pack_name: {"sha256": "cd" * 32}} if via == "pack_hashes" else None
+    out = tmp_path / "out"
+    with pytest.raises(ManifestError, match="size unknown"):
+        build_bundle([w.close()], None, out, MergeConfig(), cfg_hash="testcfg000",
+                     clip_model="none", pack_hashes=hashes)
+    assert not (out / "manifest.json").exists() and not (out / "index.sqlite").exists()
+
+
+@pytest.mark.parametrize("size", ["abc", "-5", "1.5"])
+def test_corrupt_pack_size_fails_the_merge(tmp_path, size):
+    w = ShardWriter(tmp_path / "a.sqlite", zip_name=ZIP_A,
+                    extra_info={"pack_sha256": "cd" * 32, "pack_size": str(size)})
+    w.image("IMG_1.jpg", image_cols(textured(5)))
+    with pytest.raises(ManifestError):
+        build_bundle([w.close()], None, tmp_path / "out", MergeConfig(),
+                     cfg_hash="testcfg000", clip_model="none")
 
 
 def test_refuses_shards_of_another_cfg(synthetic, tmp_path):

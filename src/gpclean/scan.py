@@ -290,6 +290,16 @@ class ScanPool:
             self._tails_dir = None
             self._light.clear()
 
+    def prepare(self) -> None:
+        """Fetch and verify the CLIP weights now instead of before the first task.
+
+        Optional (``run`` does it too, once per process): a job calls it up front so a
+        missing or corrupt model fails the job before any shard is started.
+        """
+        if self._closed:
+            raise RuntimeError("ScanPool is closed")
+        _prepare_embedder(self.embedder_name)
+
     # --------------------------------------------------------------------- internals
 
     def _new_executor(self, n: int) -> ProcessPoolExecutor:
@@ -353,47 +363,58 @@ class ScanPool:
         if self._executor is None:
             self._executor = self._new_executor(self.workers)
         executor = self._executor
-        futs: dict[Future, tuple] = {}
-        yielded: set[Future] = set()
+        # Submitted tasks whose result has not been yielded yet. A Future holds its task's
+        # result (thumbnails, embeddings) for as long as it is referenced, so it is dropped
+        # from here, and every other local, as soon as its result is handed to the caller:
+        # the parent holds only in-flight results, never the whole shard's.
+        pending: dict[Future, tuple] = {}
+        n_submitted = 0
         finished = False
         try:
             try:
                 for task in tasks:
-                    futs[executor.submit(scanworker.pool_task, (opener, task))] = task
+                    pending[executor.submit(scanworker.pool_task, (opener, task))] = task
+                    n_submitted += 1
             except BrokenProcessPool:
                 pass  # a process died since the last shard; handled like a death below
-            broken = len(futs) < len(tasks)
+            broken = n_submitted < len(tasks)
             if not broken:
                 try:
-                    for fut in as_completed(futs, timeout=_remaining(deadline)):
+                    for fut in as_completed(pending, timeout=_remaining(deadline)):
                         try:
                             res = fut.result()
                         except BrokenProcessPool:
                             broken = True
                             break
-                        yielded.add(fut)
+                        del pending[fut]
+                        del fut  # as_completed has dropped it too; the result is ours alone
                         yield res
+                        del res
                 except TimeoutError:
                     raise ShardTimeout("shard deadline passed") from None
             if broken:
                 log.warning("a scan worker process died; re-running unfinished tasks one by one")
                 self._drop_executor()
                 left = []
-                for fut, task in futs.items():
-                    if fut in yielded:
-                        continue
-                    if fut.done() and not fut.cancelled() and fut.exception() is None:
-                        yield fut.result()  # finished before the death was noticed
+                while pending:
+                    fut, task = pending.popitem()
+                    # Finished before the death was noticed: yield it, else re-run it.
+                    ok = fut.done() and not fut.cancelled() and fut.exception() is None
+                    res = fut.result() if ok else None
+                    del fut  # not kept alive while the leftovers are re-run below
+                    if ok:
+                        yield res
                     else:
                         left.append(task)
-                left.extend(tasks[len(futs):])
+                    del res
+                left.extend(tasks[n_submitted:])
                 yield from self._isolate(opener, left, deadline)
             finished = True
         finally:
             if not finished:
-                for fut in futs:
+                for fut in pending:
                     fut.cancel()
-                if any(not fut.done() for fut in futs):
+                if any(not fut.done() for fut in pending):
                     # Tasks of this shard are still running (maybe stuck, after a timeout):
                     # kill them rather than let them hold up the next shard.
                     self._drop_executor()
@@ -507,12 +528,23 @@ def _inserter(conn: sqlite3.Connection, table: str):
     return insert
 
 
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
+def _hash_file(path: Path) -> tuple[str, str]:
+    """``(sha256, md5)`` hex digests of ``path``, computed in one read.
+
+    SHA-256 is the pack's integrity hash (manifest, ``verify-bundle``); MD5 is what Google
+    Drive lists for every file (``md5Checksum``), so the CI merge can check an uploaded pack
+    against its checkpoint without downloading it. MD5 is only compared, never trusted alone.
+    """
+    sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
     with open(path, "rb") as f:
         while chunk := f.read(_HASH_CHUNK):
-            h.update(chunk)
-    return h.hexdigest()
+            sha.update(chunk)
+            md5.update(chunk)
+    return sha.hexdigest(), md5.hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    return _hash_file(path)[0]
 
 
 def _utc_now() -> str:
@@ -622,7 +654,7 @@ def _scan_into(pool: ScanPool, opener, spec: ShardSpec, ordered: list[Entry], cf
         _remaining(deadline)  # a deadline passed during the last task still counts
 
         finalize_transport_db(pack)
-        pack_sha = _sha256_file(pack_tmp)
+        pack_sha, pack_md5 = _hash_file(pack_tmp)
         pack_size = pack_tmp.stat().st_size
 
         info = {
@@ -632,7 +664,8 @@ def _scan_into(pool: ScanPool, opener, spec: ShardSpec, ordered: list[Entry], cf
             "n_items": n_items, "n_err": n_err, "n_sidecars": n_sidecars,
             "n_videos": n_videos, "n_skipped": n_skipped,
             "bytes_read": bytes_read, "bytes_discarded": bytes_discarded,
-            "pack_name": pack_path.name, "pack_sha256": pack_sha, "pack_size": pack_size,
+            "pack_name": pack_path.name, "pack_sha256": pack_sha, "pack_md5": pack_md5,
+            "pack_size": pack_size,
             "started": started, "finished": _utc_now(), "clip_model": embedder_name,
         }
         meta.executemany("INSERT INTO shard_info (key, value) VALUES (?, ?)",

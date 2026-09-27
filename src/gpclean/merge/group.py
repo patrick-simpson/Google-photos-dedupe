@@ -2,15 +2,19 @@
 
 1. **Exact:** items with equal sha256 are always duplicates (graphic or not).
 2. **Near candidates** (non-graphic items only): pairs of pHashes within Hamming distance T,
-   found with the pigeonhole principle. Split the 64 bits into T+1 contiguous chunks; two
+   found with the pigeonhole principle. Split bits 1..63 into T+1 contiguous chunks; two
    hashes that differ in at most T bits agree *exactly* on at least one chunk, so bucketing by
-   (chunk index, chunk value) and comparing only within buckets finds every such pair.
+   (chunk index, chunk value) and comparing only within buckets finds every such pair. Bit 0
+   (the DCT DC term) is left out of the chunks: it is 1 for every image that is not pure
+   black, so it carries no information and would only make chunk 0's buckets twice as big.
+   The final Hamming check still compares all 64 bits.
    Buckets larger than ``bucket_cap`` are skipped (and counted) so one pathological cluster
    cannot turn the search quadratic.
 3. **Edge checks**, all required for a near pair: Hamming <= T, aspect ratio within
    ``aspect_tol``, :func:`gpclean.imaging.fingerprint.sig_verify`, and the capture-time rule
    (two EXIF capture times 0 < |dt| <= 60 s apart, not a whole number of hours, are two
-   *different* shots of a burst, however similar).
+   *different* shots of a burst, however similar). All checks run vectorised over arrays of
+   pairs (``_Checker``), element-wise identical to the scalar functions below.
 4. **Anti-chaining:** union-find over the edges gives components; inside each component the
    best item by keeper order is the seed, and only members that pass every edge check
    *against the seed* (or against a byte-identical copy of it; or are byte-identical to the
@@ -32,7 +36,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from gpclean.config import MergeConfig
-from gpclean.imaging.fingerprint import sig_distance, sig_luma_std
+from gpclean.imaging.fingerprint import SIG_BYTES, sig_luma_std
 from gpclean.merge.localtime import parse_exif_dt, subsec_fraction, wall_seconds
 
 log = logging.getLogger(__name__)
@@ -41,6 +45,18 @@ GRAPHIC_SHOT_SCORE = 0.8
 GRAPHIC_SIG_STD = 8.0
 GRAPHIC_FLAT_FRAC = 0.35
 
+# Candidate pairs are verified this many at a time: bounds the temporary (batch, 1152) arrays
+# to a few tens of MB whatever the library size.
+EDGE_BATCH = 16_384
+# Past this many candidate pairs a count-only warning is logged: the search is still correct,
+# but verification time and memory grow linearly with the pair count (dense pHash clusters).
+CANDIDATE_WARN_PAIRS = 5_000_000
+
+_LUMA = 32  # SIG_VERSION 1 layout, as in gpclean.imaging.fingerprint: 32x32 luma, then chroma
+_BLOCK = 8  # sig_distance's block size (signature pixels)
+_LUMA_BYTES = _LUMA * _LUMA
+if SIG_BYTES != _LUMA_BYTES + 2 * 8 * 8:  # 32x32 luma + 8x8 Cb + 8x8 Cr
+    raise ImportError("signature layout changed: update sig_metrics_batch in merge/group.py")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -142,54 +158,156 @@ def capture_ok(a: DupItem, b: DupItem, cfg: MergeConfig) -> bool:
     return abs(hours - round(hours)) < 1e-6 and round(hours) >= 1
 
 
-class _Checker:
-    """Edge checks with a cache (anti-chaining re-tests pairs the union-find already saw)."""
+def sig_metrics_batch(sigs: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """:func:`~gpclean.imaging.fingerprint.sig_distance` for many pairs at once.
 
-    def __init__(self, items: list[DupItem], cfg: MergeConfig, threshold: int):
+    ``sigs`` is a (n, SIG_BYTES) uint8 matrix of signatures, ``a`` / ``b`` index its rows.
+    Returns a (k, 3) float64 array of (global luma MAD, max 8x8-block luma MAD, max abs
+    Cb/Cr difference). The values are *identical* to sig_distance, not just close: every
+    difference is an integer, so the sums are exact and dividing by 1024 or 64 (powers of
+    two) rounds the same way in both.
+    """
+    x, y = sigs[a], sigs[b]
+    d = np.maximum(x, y) - np.minimum(x, y)  # |x - y| without leaving uint8
+    g = _LUMA // _BLOCK
+    luma = d[:, :_LUMA_BYTES].reshape(-1, g, _BLOCK, g, _BLOCK)
+    # Per-block sums of 64 differences (at most 64 * 255, so uint16 cannot overflow).
+    blocks = (luma.sum(axis=4, dtype=np.uint16).sum(axis=2, dtype=np.uint16)
+              .reshape(-1, g * g))
+    out = np.empty((d.shape[0], 3), dtype=np.float64)
+    out[:, 0] = blocks.sum(axis=1, dtype=np.int64) / float(_LUMA_BYTES)
+    out[:, 1] = blocks.max(axis=1) / float(_BLOCK * _BLOCK)
+    out[:, 2] = d[:, _LUMA_BYTES:].max(axis=1)
+    return out
+
+
+class _Checker:
+    """The edge checks, vectorised over arrays of item-index pairs.
+
+    Every check of the module docstring runs in numpy on per-item columns built once here,
+    in batches of EDGE_BATCH pairs, so a dense pHash cluster with millions of candidate
+    pairs costs seconds and bounded memory, and no per-pair Python object is kept. The
+    arithmetic is element-wise the same as the scalar reference functions
+    (:func:`hamming64`, :func:`aspect_ok`, :func:`capture_ok` and ``sig_distance``, see
+    :func:`sig_metrics_batch`), so both give the same answer on every pair; the tests check
+    this.
+
+    ``rows`` are the item indices that can ever be compared (every item of a candidate pair
+    or of a byte-identical set, a superset of every union-find component); only their
+    signatures are copied into the matrix.
+    """
+
+    def __init__(self, items: list[DupItem], cfg: MergeConfig, threshold: int,
+                 rows: np.ndarray):
         self.items = items
         self.cfg = cfg
         self.t = threshold
-        self._sig: dict[tuple[int, int], tuple[float, float, float]] = {}
         self.rejected: dict[str, int] = defaultdict(int)
+        n = len(items)
+        sha_ids: dict[bytes, int] = {}
+        self.sha_id = np.array([sha_ids.setdefault(it.sha256, len(sha_ids))
+                                if it.sha256 is not None else -1 for it in items],
+                               dtype=np.int64)
+        self.near_ok = np.array([not it.is_graphic and it.phash64 is not None
+                                 for it in items], dtype=bool)
+        self.phash = _as_u64(np.array([it.phash64 if it.phash64 is not None else 0
+                                       for it in items], dtype=np.int64))
+        self.width = np.array([it.width for it in items], dtype=np.float64)
+        self.height = np.array([it.height for it in items], dtype=np.float64)
+        self.has_cap = np.array([it.capture_s is not None for it in items], dtype=bool)
+        self.cap = np.array([it.capture_s or 0 for it in items], dtype=np.int64)
+        self.has_sub = np.array([it.subsec is not None for it in items], dtype=bool)
+        self.sub = np.array([it.subsec or 0.0 for it in items], dtype=np.float64)
+        # Signature matrix; sig_row[k] = -1 when item k has no signature (or is not in rows).
+        with_sig = [int(k) for k in rows if items[int(k)].sig is not None]
+        self.sig_row = np.full(n, -1, dtype=np.int64)
+        self.sig_row[with_sig] = np.arange(len(with_sig))
+        self.sigs = np.empty((len(with_sig), SIG_BYTES), dtype=np.uint8)
+        for r, k in enumerate(with_sig):
+            sig = items[k].sig
+            if len(sig) != SIG_BYTES:  # the error sig_distance would raise
+                raise ValueError(f"signature must be {SIG_BYTES} bytes, got {len(sig)}")
+            self.sigs[r] = np.frombuffer(sig, dtype=np.uint8)
+        self.limits = np.array([cfg.sig_mad_max, cfg.sig_block_max, cfg.sig_chroma_max])
 
-    def sig_metrics(self, i: int, j: int) -> tuple[float, float, float] | None:
-        a, b = self.items[i], self.items[j]
-        if a.sig is None or b.sig is None:
-            return None
-        key = (i, j) if i < j else (j, i)
-        if key not in self._sig:
-            self._sig[key] = sig_distance(a.sig, b.sig)
-        return self._sig[key]
+    def exact(self, i: np.ndarray, j: np.ndarray) -> np.ndarray:
+        """Byte-identical (equal, known sha256), element-wise."""
+        return (self.sha_id[i] >= 0) & (self.sha_id[i] == self.sha_id[j])
 
-    def exact(self, i: int, j: int) -> bool:
-        a, b = self.items[i], self.items[j]
-        return a.sha256 is not None and a.sha256 == b.sha256
+    def _capture_ok(self, i: np.ndarray, j: np.ndarray) -> np.ndarray:
+        """:func:`capture_ok`, element-wise with the same float operations."""
+        both = self.has_cap[i] & self.has_cap[j]
+        use_sub = both & self.has_sub[i] & self.has_sub[j]
+        delta = np.where(use_sub,
+                         np.abs((self.cap[i] + self.sub[i]) - (self.cap[j] + self.sub[j])),
+                         np.abs(self.cap[i] - self.cap[j]).astype(np.float64))
+        hours = delta / 3600.0
+        whole_hours = (np.abs(hours - np.round(hours)) < 1e-6) & (np.round(hours) >= 1)
+        return (~both | (delta < 1e-6) | (delta > self.cfg.capture_window_s)) | whole_hours
 
-    def near(self, i: int, j: int, *, count: bool = False) -> bool:
-        """All near-duplicate edge checks (not the exact-sha shortcut)."""
-        a, b = self.items[i], self.items[j]
-        if a.is_graphic or b.is_graphic or a.phash64 is None or b.phash64 is None:
-            return False
-        if hamming64(a.phash64, b.phash64) > self.t:
-            return False
-        reason = None
-        if not aspect_ok(a, b, self.cfg.aspect_tol):
-            reason = "aspect"
-        else:
-            m = self.sig_metrics(i, j)
-            if m is None or not (m[0] <= self.cfg.sig_mad_max and m[1] <= self.cfg.sig_block_max
-                                 and m[2] <= self.cfg.sig_chroma_max):
-                reason = "sig"
-            elif not capture_ok(a, b, self.cfg):
-                reason = "capture"
-        if reason is not None:
-            if count:
-                self.rejected[reason] += 1
-            return False
-        return True
+    def _near_batch(self, i: np.ndarray, j: np.ndarray, count: bool) -> np.ndarray:
+        """All near-duplicate checks (not the exact-sha shortcut) for one batch of pairs.
+        With ``count``, rejections are tallied by the first check that fails."""
+        ok = np.zeros(i.size, dtype=bool)
+        # Silent skips: not near-eligible (graphic, no pHash), or too far apart in pHash.
+        live = np.flatnonzero(self.near_ok[i] & self.near_ok[j]
+                              & (np.bitwise_count(self.phash[i] ^ self.phash[j]) <= self.t))
+        a, b = i[live], j[live]
+        # aspect_ok, element-wise.
+        wa, ha, wb, hb = self.width[a], self.height[a], self.width[b], self.height[b]
+        dims = np.minimum(np.minimum(wa, ha), np.minimum(wb, hb)) > 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ra, rb = wa / ha, wb / hb
+            aspect = dims & (np.abs(ra - rb) / np.maximum(ra, rb) <= self.cfg.aspect_tol)
+        # The signature check, where both sides have a signature.
+        sig = aspect & (self.sig_row[a] >= 0) & (self.sig_row[b] >= 0)
+        s = np.flatnonzero(sig)
+        if s.size:
+            m = sig_metrics_batch(self.sigs, self.sig_row[a[s]], self.sig_row[b[s]])
+            sig[s] = (m <= self.limits).all(axis=1)
+        capture = sig & self._capture_ok(a, b)
+        if count:
+            self.rejected["aspect"] += int((~aspect).sum())
+            self.rejected["sig"] += int((aspect & ~sig).sum())
+            self.rejected["capture"] += int((sig & ~capture).sum())
+        ok[live] = capture
+        return ok
 
-    def edge(self, i: int, j: int) -> bool:
-        return self.exact(i, j) or self.near(i, j)
+    def near(self, i: np.ndarray, j: np.ndarray, *, count: bool = False) -> np.ndarray:
+        """Near-duplicate edge mask for the pairs (i[k], j[k]), in batches of EDGE_BATCH."""
+        i, j = np.asarray(i, dtype=np.int64), np.asarray(j, dtype=np.int64)
+        out = np.zeros(i.size, dtype=bool)
+        for s in range(0, i.size, EDGE_BATCH):
+            out[s:s + EDGE_BATCH] = self._near_batch(i[s:s + EDGE_BATCH], j[s:s + EDGE_BATCH],
+                                                     count)
+        return out
+
+    def verify_pairs(self, pairs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The near edges among candidate ``pairs`` (k, 2), as two index arrays.
+
+        Byte-identical pairs are left out (sha256 has joined them already); the others are
+        counted in ``self.rejected`` by the first check they fail.
+        """
+        pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        i, j = pairs[:, 0], pairs[:, 1]
+        keep = ~self.exact(i, j)
+        i, j = i[keep], j[keep]
+        ok = self.near(i, j, count=True)
+        return i[ok], j[ok]
+
+    def metrics(self, seed: int, ks: list[int]) -> list[tuple[float, float, float] | None]:
+        """Signature metrics of each item of ``ks`` against ``seed`` (None: a side has no
+        signature)."""
+        out: list[tuple[float, float, float] | None] = [None] * len(ks)
+        if self.sig_row[seed] < 0 or not ks:
+            return out
+        rows = self.sig_row[np.asarray(ks, dtype=np.int64)]
+        have = np.flatnonzero(rows >= 0)
+        if have.size:
+            m = sig_metrics_batch(self.sigs, np.full(have.size, self.sig_row[seed]), rows[have])
+            for pos, vals in zip(have.tolist(), m.tolist()):
+                out[pos] = (vals[0], vals[1], vals[2])
+        return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -198,8 +316,16 @@ class _Checker:
 
 
 def chunk_bounds(threshold: int) -> list[tuple[int, int]]:
-    """(start bit, width) of the T+1 contiguous chunks of a 64-bit hash."""
-    parts = np.array_split(np.arange(64), threshold + 1)
+    """(start bit, width) of the T+1 contiguous chunks of bits 1..63 of a 64-bit hash.
+
+    Bit 0 is the DCT DC coefficient's bit, set for every image that is not pure black: it
+    carries no information, so leaving it out keeps chunk 0's buckets as small as the
+    others. Two hashes within Hamming T over 64 bits are within T over any subset of the
+    bits, so the pigeonhole guarantee holds for the 63 bits just the same.
+    """
+    if not 0 <= threshold <= 62:
+        raise ValueError("threshold must be between 0 and 62 for a 63-bit pigeonhole split")
+    parts = np.array_split(np.arange(1, 64), threshold + 1)
     return [(int(p[0]), int(p.size)) for p in parts]
 
 
@@ -262,7 +388,13 @@ def near_candidates(phash: np.ndarray, eligible: np.ndarray, threshold: int,
                 hi_parts.append(idx[b[close]])
             d += 1
             active = active[run_end[active] - active > d]
-    return _unique_pairs(lo_parts, hi_parts, n), stats
+    pairs = _unique_pairs(lo_parts, hi_parts, n)
+    if pairs.shape[0] > CANDIDATE_WARN_PAIRS:
+        # Counts only: nothing about the items themselves goes to the log.
+        log.warning("near-duplicate search: %d candidate pairs (over %d); verification will "
+                    "be slow and memory-hungry", int(pairs.shape[0]), CANDIDATE_WARN_PAIRS)
+    stats["over_candidate_warn"] = int(pairs.shape[0] > CANDIDATE_WARN_PAIRS)
+    return pairs, stats
 
 
 def brute_candidates(phash: np.ndarray, eligible: np.ndarray, threshold: int) -> np.ndarray:
@@ -337,10 +469,13 @@ def _anti_chain(comp: list[int], items: list[DupItem], chk: _Checker) -> list[li
         sha = items[seed].sha256
         seed_class = [k for k in remaining if sha is not None and items[k].sha256 == sha]
         seed_class = seed_class or [seed]
-        group, rest = [seed], []
-        for k in remaining[1:]:
-            ok = chk.exact(seed, k) or any(chk.near(t, k) for t in seed_class if t != k)
-            (group if ok else rest).append(k)
+        others = np.array(remaining[1:], dtype=np.int64)
+        ok = chk.exact(np.full(others.size, seed), others)
+        for t in seed_class:
+            todo = np.flatnonzero(~ok & (others != t))  # an item is not its own near copy
+            if todo.size:
+                ok[todo] = chk.near(np.full(todo.size, t), others[todo])
+        group, rest = [seed, *others[ok].tolist()], others[~ok].tolist()
         # A byte-identical copy of an absorbed member is as close to the seed as that member;
         # it can only miss the seed check when it is graphic by name (e.g. a "Screenshot_"
         # copy of a photo), and it belongs with its twin.
@@ -359,12 +494,12 @@ def _emit(members: list[int], items: list[DupItem], chk: _Checker) -> DupGroup:
     seed = members[0]
     shas = {items[k].sha256 for k in members}
     urls = {items[k].url for k in members if items[k].url}
+    sig_m = [(0.0, 0.0, 0.0), *chk.metrics(seed, members[1:])]
     metrics = {}
-    for k in members:
+    for k, sm in zip(members, sig_m):
         a, b = items[seed], items[k]
         dist = (hamming64(a.phash64, b.phash64)
                 if a.phash64 is not None and b.phash64 is not None else None)
-        sm = (0.0, 0.0, 0.0) if k == seed else chk.sig_metrics(seed, k)
         metrics[k] = (dist, *(sm if sm is not None else (None, None, None)))
     return DupGroup(
         members=list(members),
@@ -378,24 +513,27 @@ def _emit(members: list[int], items: list[DupItem], chk: _Checker) -> DupGroup:
 def _group_from_pairs(items: list[DupItem], pairs: np.ndarray, cfg: MergeConfig,
                       threshold: int) -> tuple[list[DupGroup], dict]:
     n = len(items)
-    chk = _Checker(items, cfg, threshold)
     uf = _UnionFind(n)
     by_sha: dict[bytes, list[int]] = defaultdict(list)
     for k, it in enumerate(items):
         if it.sha256 is not None:
             by_sha[it.sha256].append(k)
     exact_pairs = 0
+    in_sha_sets: list[int] = []
     for ks in by_sha.values():
+        if len(ks) >= 2:
+            in_sha_sets.extend(ks)
         for k in ks[1:]:
             uf.union(ks[0], k)
             exact_pairs += 1
-    verified = 0
-    for i, j in pairs.tolist():
-        if chk.exact(i, j):
-            continue  # already joined
-        if chk.near(i, j, count=True):
-            uf.union(i, j)
-            verified += 1
+    # Every component is made of candidate-pair items and byte-identical sets.
+    rows = np.union1d(np.asarray(pairs, dtype=np.int64).ravel(),
+                      np.array(in_sha_sets, dtype=np.int64))
+    chk = _Checker(items, cfg, threshold, rows)
+    edge_i, edge_j = chk.verify_pairs(pairs)  # byte-identical pairs are skipped: joined
+    for i, j in zip(edge_i.tolist(), edge_j.tolist()):
+        uf.union(i, j)
+    verified = int(edge_i.size)
 
     comps: dict[int, list[int]] = defaultdict(list)
     for k in range(n):

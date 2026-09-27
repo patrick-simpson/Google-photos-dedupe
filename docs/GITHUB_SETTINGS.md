@@ -101,6 +101,10 @@ keep to it:
 Anything that reaches `main` can use your Drive key, so only merge what Claude asked you to
 merge in the chat.
 
+Merging changes the code on GitHub only. When a change affects the app on your PC (the
+review site, Claude's photo tools, or the helper scripts), Claude asks you to update it:
+see [Updating the app](SETUP_WINDOWS.md#updating-the-app-when-claude-asks-you-to).
+
 ## Never do this
 
 - Never click **Re-run jobs** > **Enable debug logging** (or "Re-run with debug

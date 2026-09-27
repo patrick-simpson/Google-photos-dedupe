@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import logging
 import os
 import urllib.request
@@ -114,6 +115,77 @@ def _sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
+# --- "already verified" sidecar marker ------------------------------------------------------
+#
+# Hashing ~600 MB of weights takes seconds, and it used to happen on *every* ImageEmbedder /
+# TextEmbedder load -- once per scan-pool worker, and on every review-site / MCP server start.
+# So after a successful sha256 check we drop a tiny JSON sidecar next to the weights,
+# ``<file>.verified``, recording the digest together with the file's size and mtime_ns *as they
+# were when hashing started*. A later load trusts the file without re-hashing only if the
+# marker names the pinned digest and the file's current size and mtime_ns are unchanged;
+# anything else (no marker, unreadable marker, a replaced or touched file, a different pin)
+# falls back to a full re-hash. A download is always fully hashed, never trusted via a marker.
+
+
+def _marker_path(dest: Path) -> Path:
+    """The sidecar marker recording that ``dest`` was sha256-verified."""
+    return dest.with_name(f"{dest.name}.verified")
+
+
+def _marker_matches(dest: Path, expected_sha256: str) -> bool:
+    """True if ``dest``'s marker vouches for ``expected_sha256`` at ``dest``'s current size and
+    mtime_ns. Any problem reading or parsing the marker just means "not trusted" (re-hash)."""
+    try:
+        st = dest.stat()
+        data = json.loads(_marker_path(dest).read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # missing/unreadable file or marker, or malformed JSON
+        return False
+    if not isinstance(data, dict):
+        return False
+    return (
+        data.get("sha256") == expected_sha256
+        and data.get("size") == st.st_size
+        and data.get("mtime_ns") == st.st_mtime_ns
+    )
+
+
+def _write_marker(dest: Path, sha256: str, st: os.stat_result) -> None:
+    """Record that ``dest`` (with stat ``st``, taken *before* hashing) hashed to ``sha256``.
+
+    Using the pre-hash stat means a file modified while it was being hashed gets a marker that
+    no longer matches it, so the next load re-hashes rather than trusting stale bytes. The
+    marker is written to a temp name and renamed into place so a reader never sees half a
+    file. Failing to write it is harmless (the next load just re-hashes), so it only warns.
+    """
+    marker = _marker_path(dest)
+    tmp = marker.with_name(f"{marker.name}.tmp-{os.getpid()}")
+    payload = {"sha256": sha256, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, marker)
+    except OSError as exc:
+        logger.warning("could not write clip verification marker (%s)", type(exc).__name__)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _remove_marker(dest: Path) -> None:
+    """Drop ``dest``'s marker (if any), e.g. because ``dest`` itself is being removed."""
+    try:
+        _marker_path(dest).unlink(missing_ok=True)
+    except OSError:
+        pass  # a leftover marker is harmless: it can't match a different file's size/mtime
+
+
+def _verify_file(dest: Path, expected_sha256: str) -> bool:
+    """Fully hash ``dest``; on a match, (re)write its marker. Returns whether it matched."""
+    st = dest.stat()  # before hashing -- see _write_marker
+    if _sha256_of(dest) != expected_sha256:
+        return False
+    _write_marker(dest, expected_sha256, st)
+    return True
+
+
 def _weights_url(spec: ModelSpec) -> str:
     """The exact, revision-pinned download URL for ``spec``'s weights file."""
     return f"https://huggingface.co/{spec.hf_repo}/resolve/{spec.revision}/{spec.filename}"
@@ -142,9 +214,12 @@ def _download(url: str, dest: Path, *, timeout: float = 60.0) -> None:
 def fetch_model(name: str, *, download: bool = True) -> Path:
     """Return a local, sha256-verified path to model ``name``'s weights.
 
-    Skips the download when a verified copy is already cached. On a hash mismatch (a corrupt
+    Skips the download when a verified copy is already cached. A cached copy whose
+    ``.verified`` marker still matches its size and mtime_ns is trusted without re-hashing
+    (see ``_marker_matches``); otherwise it is fully re-hashed. On a hash mismatch (a corrupt
     or unexpectedly-changed download), the bad file is deleted and ``ValueError`` is raised --
-    callers must not fall back to using unverified weights.
+    callers must not fall back to using unverified weights. A fresh download is always fully
+    hashed before it is used.
 
     ``download=False`` (used by :class:`TextEmbedder`, which runs in long-lived, latency-
     sensitive processes like the review site and the MCP server) never touches the network:
@@ -152,14 +227,24 @@ def fetch_model(name: str, *, download: bool = True) -> Path:
     explicit ``gpclean fetch-model`` command, instead of silently starting a ~600 MB download
     inside what's supposed to be a quick request/tool call.
     """
+    return _fetch_model(name, download=download, trust_marker=True)
+
+
+def _fetch_model(name: str, *, download: bool, trust_marker: bool) -> Path:
+    """:func:`fetch_model`, plus ``trust_marker=False`` to force a full re-hash of a cached
+    copy even when its marker matches (used by the explicit ``gpclean fetch-model`` command)."""
     spec = MODELS[name]
     dest = _cache_path(spec)
 
     if dest.exists():
-        if _sha256_of(dest) == spec.sha256:
+        if trust_marker and _marker_matches(dest, spec.sha256):
+            logger.info("clip weights already cached (verified marker): %s", name)
+            return dest
+        if _verify_file(dest, spec.sha256):
             logger.info("clip weights already cached: %s", name)
             return dest
         logger.warning("cached clip weights failed verification, refetching: %s", name)
+        _remove_marker(dest)
         dest.unlink()
 
     if not download:
@@ -174,6 +259,8 @@ def fetch_model(name: str, *, download: bool = True) -> Path:
     tmp = dest.with_name(f"{dest.name}.part-{os.getpid()}")
     try:
         _download(_weights_url(spec), tmp)
+        # Always a full hash here: a marker is never a substitute for verifying a download.
+        tmp_stat = tmp.stat()
         digest = _sha256_of(tmp)
         if digest != spec.sha256:
             raise ValueError(
@@ -188,9 +275,13 @@ def fetch_model(name: str, *, download: bool = True) -> Path:
             # rename onto it. That's fine as long as *their* copy verifies -- use it instead
             # of failing the whole worker. If it doesn't verify, this really is some other
             # problem (e.g. permissions), so re-raise.
-            if not (dest.exists() and _sha256_of(dest) == spec.sha256):
+            if not (dest.exists() and _verify_file(dest, spec.sha256)):
                 raise
             logger.info("clip weights already installed by another process: %s", name)
+        else:
+            # A rename keeps size and mtime, so the pre-hash stat of `tmp` describes `dest`
+            # now; if anything touched it since, the marker simply won't match next time.
+            _write_marker(dest, digest, tmp_stat)
     finally:
         # No-op once os.replace succeeded; cleans up a bad/partial download otherwise.
         tmp.unlink(missing_ok=True)
@@ -203,10 +294,12 @@ def cli_fetch_model(model: str) -> int:
     """``gpclean fetch-model --model {b32,b16}``: fetch + verify, printing a short local status.
 
     This is a local, interactive command (not library code), so it prints normally per the
-    logging rules in docs/INTERFACES.md.
+    logging rules in docs/INTERFACES.md. Being the explicit "make sure the weights are good"
+    command, it always fully re-hashes a cached copy instead of trusting its ``.verified``
+    marker, so running it is also the way to re-check a copy by hand.
     """
     try:
-        path = fetch_model(model)
+        path = _fetch_model(model, download=True, trust_marker=False)
     except Exception as exc:  # noqa: BLE001 - any failure is reported the same way
         print(f"fetch-model {model}: FAILED ({exc})")
         return 1
