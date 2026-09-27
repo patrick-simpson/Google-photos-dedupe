@@ -258,9 +258,13 @@ def open_review(path: str | Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=5.0, isolation_level=None, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.executescript(REVIEW_DDL)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.executescript(REVIEW_DDL)
+    except BaseException:
+        conn.close()  # do not leak a half-open connection on retry
+        raise
     return conn

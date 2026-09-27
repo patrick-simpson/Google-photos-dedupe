@@ -405,3 +405,78 @@ Writes `out/takeout-20260101T000000Z-001.zip`, `-002.zip` (export A) and
 `item_key` = the fake url id (`AF1QipFAKE...`) when the item has a sidecar with a url, else
 `nourl:<filename>`. An item's key equals its bundle `item_uid` minus the `g:` prefix when a url
 exists.
+
+## Addenda from wave 1 (implemented; binding for later modules)
+**takeout.names / sidecar**
+- A `(n)` preceded by a space (`Photo (1).jpg`, `... AM (1).jpeg`) is NOT a Takeout dup index.
+- `pair()`: R1/R2/R5 may pair a title-less sidecar with conf `low`; R3/R4/R6 require a title.
+  A prefix-only title match needs both timestamps and an exact quarter-hour offset and must not
+  name another present media file. **Callers must include video media in `pair()`** (so a video
+  can claim its own sidecar). `parse_sidecar` caps text fields and drops timestamps outside ±1e12;
+  timestamp 0 -> None; `from_shared_album`/`from_partner` = 1 when the key exists under
+  `googlePhotosOrigin`; missing booleans -> 0.
+
+**takeout.rangefile / zipsource**
+- `ZipSource.zipfile(*, fresh=False)` returns a shared ZipFile; call once per worker per zip and
+  never close it per task. `ZipSource.broken` / `HTTPRangeFile.broken`; 408/429/5xx retried.
+- Permanent read failures raise `RangeReadError(OSError)` with `.retryable`. Scan: catch
+  `(OSError, zipfile.BadZipFile, zlib.error, DecompressionBombError)` per item; if a
+  `RangeReadError` is retryable or the source is broken, **abort the shard** (resumable) instead
+  of recording item errors. `plan_span` splits non-consecutive entries itself and never reads
+  into an unrequested member. Extra kwargs: `HTTPRangeFile(..., backoff=1.0, sleep=time.sleep)`,
+  `ZipSource.open_http(url, size, tail=None, *, timeout=60.0, retries=5, backoff=1.0)`.
+
+**imaging**
+- `decode` raises `OSError` (incl. re-raised Pillow/libheif errors) or `DecompressionBombError`.
+  `process_image` calls `configure_pillow(cfg.max_pixels)` (idempotent). MPO opens via JPEG.
+- `sig_verify` alone does NOT separate same-template chat screenshots: the merge MUST keep the
+  `is_graphic` exclusion (flat_frac >= 0.35 or screenshot score >= 0.8 or sig luma std < 8).
+
+**clipmodel**
+- Pins: b32 `laion/CLIP-ViT-B-32-DataComp.XL-s13B-b90K@f0e2ffa0…` `open_clip_model.safetensors`;
+  b16 `laion/CLIP-ViT-B-16-DataComp.XL-s13B-b90K@d110532e…` `open_clip_pytorch_model.bin`
+  (loaded with `weights_only=True`). Cache: `$HF_HOME/gpclean/...`.
+- The scan parent must call `fetch_model(name)` once BEFORE starting the pool; workers only load.
+- `get_image_embedder(name, *, threads=None)`; `StubEmbedder(dim).embed(str | list[Image])`.
+
+**publiclog**
+- Import early (it removes `GPCLEAN_PUBLIC_FD` from `os.environ` at import). Lines look like
+  `PROGRESS phase=2 done=10`. Helpers: `set_phase(n)`, `disable_public()` (call it in scan worker
+  initializers), `setup_logging()` returns the private log path (`gpclean.log`).
+  `github_output` accepts ints, bools, restricted strings and lists of ints (compact JSON).
+
+**rclone / store**
+- `Rclone(config=None, binary=..., log_file=None, *, out_root="gp:gpclean-output")` (defaults from
+  `GPCLEAN_REMOTE`/`GPCLEAN_OUT_ROOT`/`GPCLEAN_PRIVATE_DIR`); extra: `stat()`, `lsf()`,
+  `cat_to_file()`, `about()`, `version()`, `is_under_out_root()`, `lsjson(..., max_depth=)`,
+  `access_token(remote, refresh=False)`, `serve_quota_hit()`. Errors: `RcloneError(.returncode)`,
+  `QuotaError(RcloneError)`, `RcloneDenied(PermissionError)`. `serve_http` yields a base URL
+  without trailing slash. Binary comes from `GPCLEAN_RCLONE` or PATH: **no file under src/ other
+  than rclone.py may contain the literal word for the binary in code**.
+- `RcloneStore.get` downloads via `cat`; `list(rel_dir)` is recursive, sorted POSIX paths
+  relative to `rel_dir`; missing dir -> [].
+
+**review_db / bundle_read / search**
+- Proposer must match `^claude(:[A-Za-z0-9._-]{1,64})?$` (MCP passes e.g. `claude:code`).
+  batch_id `^[A-Za-z0-9._:-]{1,80}$`; category None or `^[a-z_]{1,32}$`.
+- `user_add` upgrades proposed/rejected rows to approved (user wins). `decide()` skips rows
+  marked deleted. `set_group_decision(..., action='clear')` removes a decision.
+- Helpers: `review_db.strip_unsafe()`, `sanitise_reason()`; `Bundle.fetchall()`, `count()`,
+  `scores_many()`, `memberships()`, `dup_group(id)`, `burst(id)`, `n_dup_groups()`, `n_bursts()`;
+  `ReviewDB.uids()`, `batches()`, `events()`, `close()`. `search()` raises
+  `SearchUnavailable(ValueError)` for a text query without embedder/embeddings.
+- `tests/bundle_factory.py` (`make_bundle`, `plan_items`, `StubTextEmbedder`) is the shared test
+  helper for site / MCP / sheet tests (`from bundle_factory import ...`).
+
+**fixtures**
+- `expected.json` describes an `include_albums=true` run (top-level `"include_albums": true`);
+  `gpclean.fixtures.generate.expected_view(expected, include_albums=False)` derives the truth for
+  a default run. Collapse happens before grouping. `junk` is exhaustive only for screenshot,
+  messaging, tiny, dup_extra, burst_extra.
+
+**check_repo rules**
+- No line may start with `type = drive`; no refresh-token JSON; emails only @example.com /
+  users.noreply.github.com / anthropic.com; workflows: only pinned `actions/checkout` or local
+  reusable workflows, top-level `permissions: {}`, `persist-credentials: false`, no
+  `secrets: inherit`, no `: write` permissions, no `${{ }}` inside `run:` except bare
+  `${{ matrix.x }}`; `pull_request` only in ci.yml; no denied rclone verbs in code or scripts.

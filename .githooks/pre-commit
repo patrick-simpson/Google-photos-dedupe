@@ -1,0 +1,15 @@
+#!/bin/sh
+# Repo hygiene gate before every commit (images, databases, tokens, emails, workflow lint).
+# Enable once per clone:  git config core.hooksPath .githooks
+# Git for Windows runs this with its bundled sh.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+# Prefer the project venv, then any working Python 3 (the Windows "python3" Store alias is a
+# stub that fails, so each candidate is actually run before it is trusted).
+for py in .venv/bin/python .venv/Scripts/python.exe python3 python py; do
+  if "$py" -c "import sys; sys.exit(sys.version_info < (3, 8))" >/dev/null 2>&1; then
+    exec "$py" tools/check_repo.py
+  fi
+done
+echo "pre-commit: no Python 3 found to run tools/check_repo.py" >&2
+exit 1

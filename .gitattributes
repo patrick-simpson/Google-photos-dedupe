@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.sh text eol=lf
+.githooks/* text eol=lf
+*.lock text eol=lf
