@@ -1,0 +1,212 @@
+# One scan pass (called up to three times by pipeline.yml; docs/PLAN.md §2).
+#
+# pending  -> lists the meta checkpoints on Drive; outputs how many shards are left and the
+#             worker matrix (integers only).
+# scan     -> W parallel workers; worker w takes every W-th pending shard. Each shard uploads
+#             its thumb pack first and its meta file (the checkpoint) last, so a killed or
+#             failed worker loses at most the shard in progress; the next pass redoes it.
+# finalize -> re-lists Drive and outputs done / quota for the caller's pass2 / pass3 gates.
+#
+# Every job here has environment: photos (its secret is available only to jobs that name
+# the environment; there is no secrets: inherit). Same safety rules as pipeline.yml,
+# including the refs/heads/main guard (github.ref is the caller's ref here).
+name: scan-pass
+
+on:
+  workflow_call:
+    inputs:
+      pass:
+        type: number
+        required: true
+      folder:
+        type: string
+        required: true
+      include_albums:
+        type: boolean
+        required: true
+      mode:
+        type: string
+        required: true
+      clip_model:
+        type: string
+        required: true
+      workers:
+        type: string
+        required: true
+    outputs:
+      done:
+        description: "'true' when every shard has a checkpoint"
+        value: ${{ jobs.finalize.outputs.done }}
+      quota:
+        description: "'true' when a worker stopped on a Drive quota"
+        value: ${{ jobs.finalize.outputs.quota }}
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GPCLEAN_FOLDER: ${{ inputs.folder }}
+  GPCLEAN_INCLUDE_ALBUMS: ${{ inputs.include_albums }}
+  GPCLEAN_MODE: ${{ inputs.mode }}
+  GPCLEAN_CLIP_MODEL: ${{ inputs.clip_model }}
+  GPCLEAN_WORKERS: ${{ inputs.workers }}
+  GPCLEAN_PASS: ${{ inputs.pass }}
+  GPCLEAN_RUN_ID: ${{ github.run_id }}
+  GPCLEAN_ATTEMPT: ${{ github.run_attempt }}
+  # mode=selftest uses code defaults (gpclean.ci): shards of 10 photos, and the second
+  # shard fails on purpose in pass 1 so pass 2 must pick it up.
+  GPCLEAN_PUBLIC_FD: "3"
+
+jobs:
+  pending:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    environment: photos
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    env:
+      GPCLEAN_JOB: pending
+    outputs:
+      count: ${{ steps.pending.outputs.count }}
+      of: ${{ steps.pending.outputs.of }}
+      workers: ${{ steps.pending.outputs.workers }}
+      ids: ${{ steps.pending.outputs.ids }}
+      quota: ${{ steps.pending.outputs.quota }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/private"
+          echo "GPCLEAN_PRIVATE_DIR=$RUNNER_TEMP/private" >> "$GITHUB_ENV"
+          bash tools/install_tools.sh --rclone "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: sync
+        run: uv sync --locked --no-dev >>"$GPCLEAN_PRIVATE_DIR/setup.log" 2>&1
+      - name: decode drive credentials
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rc"
+          printf '%s' "$RCLONE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/rc/rclone.conf"
+          chmod 600 "$RUNNER_TEMP/rc/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/rc/rclone.conf" >> "$GITHUB_ENV"
+      - name: scope check
+        id: scope
+        run: .venv/bin/python -m gpclean ci-scope-check 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: pending
+        id: pending
+        run: .venv/bin/python -m gpclean ci-pending 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: upload private logs
+        if: ${{ always() && steps.scope.outcome == 'success' }}
+        run: .venv/bin/python -m gpclean ci-upload-logs 3>/dev/null 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1 || true
+      - name: remove drive credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/rc"
+
+  scan:
+    needs: pending
+    if: ${{ needs.pending.outputs.count != '0' }}
+    runs-on: ubuntu-24.04
+    environment: photos
+    permissions:
+      contents: read
+    # A failed worker must not fail the pass: finalize and the next pass look at Drive.
+    continue-on-error: true
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJSON(needs.pending.outputs.workers) }}
+    env:
+      GPCLEAN_JOB: scan
+      GPCLEAN_WORKER: ${{ matrix.worker }}
+      GPCLEAN_OF: ${{ needs.pending.outputs.of }}
+      GPCLEAN_PENDING_IDS: ${{ needs.pending.outputs.ids }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/private"
+          echo "GPCLEAN_PRIVATE_DIR=$RUNNER_TEMP/private" >> "$GITHUB_ENV"
+          bash tools/install_tools.sh --rclone "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: sync
+        run: uv sync --locked --no-dev --group clip >>"$GPCLEAN_PRIVATE_DIR/setup.log" 2>&1
+      - name: decode drive credentials
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rc"
+          printf '%s' "$RCLONE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/rc/rclone.conf"
+          chmod 600 "$RUNNER_TEMP/rc/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/rc/rclone.conf" >> "$GITHUB_ENV"
+      - name: scope check
+        id: scope
+        run: .venv/bin/python -m gpclean ci-scope-check 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: scan
+        run: .venv/bin/python -m gpclean ci-scan --worker "$GPCLEAN_WORKER" --of "$GPCLEAN_OF" 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: upload private logs
+        if: ${{ always() && steps.scope.outcome == 'success' }}
+        run: .venv/bin/python -m gpclean ci-upload-logs 3>/dev/null 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1 || true
+      - name: remove drive credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/rc"
+
+  finalize:
+    needs: [pending, scan]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    environment: photos
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    env:
+      GPCLEAN_JOB: finalize
+      # 'true' when pending itself stopped on a quota (then no worker wrote a flag).
+      GPCLEAN_PENDING_QUOTA: ${{ needs.pending.outputs.quota }}
+    outputs:
+      done: ${{ steps.finalize.outputs.done }}
+      quota: ${{ steps.finalize.outputs.quota }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/private"
+          echo "GPCLEAN_PRIVATE_DIR=$RUNNER_TEMP/private" >> "$GITHUB_ENV"
+          bash tools/install_tools.sh --rclone "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: sync
+        run: uv sync --locked --no-dev >>"$GPCLEAN_PRIVATE_DIR/setup.log" 2>&1
+      - name: decode drive credentials
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rc"
+          printf '%s' "$RCLONE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/rc/rclone.conf"
+          chmod 600 "$RUNNER_TEMP/rc/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/rc/rclone.conf" >> "$GITHUB_ENV"
+      - name: scope check
+        id: scope
+        run: .venv/bin/python -m gpclean ci-scope-check 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: finalize
+        id: finalize
+        run: .venv/bin/python -m gpclean ci-finalize 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: upload private logs
+        if: ${{ always() && steps.scope.outcome == 'success' }}
+        run: .venv/bin/python -m gpclean ci-upload-logs 3>/dev/null 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1 || true
+      - name: remove drive credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/rc"

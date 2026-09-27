@@ -9,6 +9,7 @@
 !/tools/
 !/docs/
 !/README.md
+!/CLAUDE.md
 !/LICENSE
 !/pyproject.toml
 !/uv.lock

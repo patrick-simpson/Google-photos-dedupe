@@ -1,0 +1,51 @@
+# Tests on every push and pull request. No secrets, no environment, no caches, no artifacts:
+# fork PRs can run this safely, and nothing here can reach Google Drive.
+# tools/check_repo.py lints this file (pinned actions only, permissions, triggers, ...).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test:
+    name: test
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pinned uv (+ rclone for the rclone-marked tests) with hard-coded SHA-256s.
+      - name: install tools (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash tools/install_tools.sh --rclone "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: install uv (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/install_uv.ps1 -Dest "$env:RUNNER_TEMP\bin"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value "$env:RUNNER_TEMP\bin"
+
+      - name: sync
+        run: uv sync --locked --group dev --group mcp
+
+      - name: repo hygiene
+        run: uv run --frozen python tools/check_repo.py
+
+      - name: tests
+        run: uv run --frozen pytest -q
