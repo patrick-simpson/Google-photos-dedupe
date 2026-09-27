@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<!-- Per-launch CSRF token, injected by the server. Every POST sends it as X-CSRF-Token. -->
+<meta name="csrf-token" content="__GPCLEAN_CSRF_TOKEN__">
+<title>gpclean review</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1>gpclean</h1>
+  <nav class="tabs" id="tabs" aria-label="Views">
+    <button type="button" data-tab="dups">Duplicates</button>
+    <button type="button" data-tab="junk">Junk</button>
+    <button type="button" data-tab="search">Search</button>
+    <button type="button" data-tab="queue">To delete <span class="badge" id="proposal-badge" hidden></span></button>
+  </nav>
+  <div class="summary" id="summary" aria-live="polite"></div>
+  <button type="button" class="help-button" id="help-button" title="Keyboard shortcuts (?)">?</button>
+</header>
+<div class="banner" id="banner" hidden>
+  <span id="banner-text"></span>
+  <button type="button" id="banner-close">Dismiss</button>
+</div>
+<main id="view" tabindex="-1">
+  <p class="muted">Loading...</p>
+</main>
+<aside class="preview" id="preview" hidden>
+  <img id="preview-img" alt="Preview">
+</aside>
+<div class="toast" id="toast" role="status" hidden></div>
+<div class="overlay" id="help" hidden>
+  <div class="help-panel" role="dialog" aria-label="Keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl>
+      <dt>j / k</dt><dd>next / previous item</dd>
+      <dt>space</dt><dd>show or hide the large preview</dd>
+      <dt>x</dt><dd>select or unselect the item (shift-click selects a range)</dd>
+      <dt>a</dt><dd>approve (To delete) or add the selection to the queue (Junk, Search)</dd>
+      <dt>r</dt><dd>reject</dd>
+      <dt>u</dt><dd>undo a decision (back to proposed, or remove your own addition)</dd>
+      <dt>o</dt><dd>open the item in Google Photos (a new tab; close it with Ctrl+W after pressing #)</dd>
+      <dt>d</dt><dd>deletion mode: mark deleted and move to the next item</dd>
+      <dt>1-9</dt><dd>Duplicates: make member N the keeper of the current group</dd>
+      <dt>?</dt><dd>show or hide this help</dd>
+      <dt>Esc</dt><dd>close preview and help</dd>
+    </dl>
+    <p class="muted">In Google Photos, press # (Shift+3) to move the open photo to the trash.</p>
+    <button type="button" id="help-close">Close</button>
+  </div>
+</div>
+</body>
+</html>

@@ -106,6 +106,27 @@ def _write_public(line: str) -> None:
         pass  # stderr closed/None (e.g. pythonw); nothing sensible left to do
 
 
+def add_mask(secret: str) -> None:
+    """Ask the Actions runner to mask ``secret`` in all later console output of this job.
+
+    Writes ``::add-mask::<secret>`` to the public console, and ONLY there: when fd 3 is not
+    the console (locally, in tests, in workers) nothing is written at all, because the
+    stderr fallback would put the secret into the private log. The value is never logged.
+    A value containing a line break (or other control character) is refused: it could not
+    be masked as a whole and would end the workflow command early.
+    """
+    if not isinstance(secret, str) or not secret:
+        raise ValueError("add_mask needs a non-empty string")
+    if any(ord(ch) < 32 or ch == "\x7f" for ch in secret):
+        raise ValueError("add_mask value contains control characters")
+    if not _PUBLIC_OK or _public_disabled:
+        return
+    try:
+        os.write(PUBLIC_FD, ("::add-mask::" + secret + "\n").encode("utf-8"))
+    except OSError:
+        pass  # console gone: nothing more is printed publicly either
+
+
 def disable_public() -> None:
     """Stop this process from ever writing to fd 3 (call it in worker-process initialisers).
 

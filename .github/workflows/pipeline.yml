@@ -1,0 +1,288 @@
+# The Drive pipeline: plan -> up to three scan passes -> merge -> report (docs/PLAN.md §2, §9).
+#
+# Safety rules this file follows (tools/check_repo.py lints them; tests/test_workflows.py too):
+# - workflow_dispatch only; top-level permissions: {}; every job gets contents: read only.
+# - inputs reach code through env: only and are validated in Python (gpclean.ci.load_env);
+#   no ${{ }} expression ever appears inside a run: script.
+# - the only action is actions/checkout, pinned by SHA, with persist-credentials: false.
+# - the rclone config secret is decoded under umask 077 into $RUNNER_TEMP/rc and removed in
+#   an if: always() step. gpclean masks every token in it (ci-scope-check) before anything
+#   else runs, and fails closed unless the token has exactly drive.readonly + drive.file.
+# - the public console gets numbers only: every gpclean step runs as
+#   `python -m gpclean <cmd> 3>&1 1>>private/run.log 2>&1`, and only publiclog writes to fd 3.
+# - no caches, no artifacts, no secrets: inherit, no write permissions, static run-name.
+name: pipeline
+run-name: gpclean pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: Drive folder holding the Takeout zips
+        type: string
+        default: Takeout
+      threshold:
+        description: near-duplicate pHash threshold (merge time only)
+        type: choice
+        options: ["2", "3", "4", "5"]
+        default: "3"
+      include_albums:
+        description: also scan photos inside album folders
+        type: boolean
+        default: false
+      mode:
+        description: full | probe | merge_only | selftest
+        type: choice
+        options: [full, probe, merge_only, selftest]
+        default: full
+      clip_model:
+        description: CLIP image model (none = no embeddings)
+        type: choice
+        options: [b32, b16, none]
+        default: b32
+      workers:
+        description: parallel scan jobs
+        type: choice
+        options: ["1", "2", "3", "4", "5", "6", "7", "8"]
+        default: "6"
+
+permissions: {}
+
+concurrency:
+  group: gpclean
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GPCLEAN_FOLDER: ${{ inputs.folder }}
+  GPCLEAN_THRESHOLD: ${{ inputs.threshold }}
+  GPCLEAN_INCLUDE_ALBUMS: ${{ inputs.include_albums }}
+  GPCLEAN_MODE: ${{ inputs.mode }}
+  GPCLEAN_CLIP_MODEL: ${{ inputs.clip_model }}
+  GPCLEAN_WORKERS: ${{ inputs.workers }}
+  GPCLEAN_RUN_ID: ${{ github.run_id }}
+  GPCLEAN_ATTEMPT: ${{ github.run_attempt }}
+  # The selftest's shard size and forced failure are code defaults (gpclean.ci), never
+  # workflow values: the shard size is hashed into cfg and must match in every job.
+  GPCLEAN_PUBLIC_FD: "3"
+
+jobs:
+  probe:
+    if: ${{ inputs.mode == 'probe' }}
+    runs-on: ubuntu-24.04
+    environment: photos
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    env:
+      GPCLEAN_JOB: probe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/private"
+          echo "GPCLEAN_PRIVATE_DIR=$RUNNER_TEMP/private" >> "$GITHUB_ENV"
+          bash tools/install_tools.sh --rclone "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: sync
+        run: uv sync --locked --no-dev --group clip >>"$GPCLEAN_PRIVATE_DIR/setup.log" 2>&1
+      - name: decode drive credentials
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rc"
+          printf '%s' "$RCLONE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/rc/rclone.conf"
+          chmod 600 "$RUNNER_TEMP/rc/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/rc/rclone.conf" >> "$GITHUB_ENV"
+      - name: scope check
+        run: .venv/bin/python -m gpclean ci-scope-check 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: probe
+        run: .venv/bin/python -m gpclean probe 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: upload private logs
+        if: always()
+        run: .venv/bin/python -m gpclean ci-upload-logs 3>/dev/null 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1 || true
+      - name: remove drive credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/rc"
+
+  plan:
+    if: ${{ inputs.mode != 'probe' }}
+    runs-on: ubuntu-24.04
+    environment: photos
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    env:
+      GPCLEAN_JOB: plan
+    outputs:
+      n_zips: ${{ steps.plan.outputs.n_zips }}
+      n_shards: ${{ steps.plan.outputs.n_shards }}
+      n_exports: ${{ steps.plan.outputs.n_exports }}
+      pending: ${{ steps.plan.outputs.pending }}
+      bad_zips: ${{ steps.plan.outputs.bad_zips }}
+      quota: ${{ steps.plan.outputs.quota }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/private"
+          echo "GPCLEAN_PRIVATE_DIR=$RUNNER_TEMP/private" >> "$GITHUB_ENV"
+          bash tools/install_tools.sh --rclone "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: sync
+        run: uv sync --locked --no-dev >>"$GPCLEAN_PRIVATE_DIR/setup.log" 2>&1
+      - name: decode drive credentials
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rc"
+          printf '%s' "$RCLONE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/rc/rclone.conf"
+          chmod 600 "$RUNNER_TEMP/rc/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/rc/rclone.conf" >> "$GITHUB_ENV"
+      - name: scope check
+        run: .venv/bin/python -m gpclean ci-scope-check 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: upload selftest fixtures
+        if: ${{ inputs.mode == 'selftest' }}
+        run: .venv/bin/python -m gpclean selftest-upload 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: plan
+        id: plan
+        run: .venv/bin/python -m gpclean ci-plan 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: upload private logs
+        if: always()
+        run: .venv/bin/python -m gpclean ci-upload-logs 3>/dev/null 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1 || true
+      - name: remove drive credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/rc"
+
+  pass1:
+    needs: plan
+    if: ${{ inputs.mode != 'merge_only' && inputs.mode != 'probe' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/scan-pass.yml
+    with:
+      pass: 1
+      folder: ${{ inputs.folder }}
+      include_albums: ${{ inputs.include_albums }}
+      mode: ${{ inputs.mode }}
+      clip_model: ${{ inputs.clip_model }}
+      workers: ${{ inputs.workers }}
+
+  pass2:
+    needs: pass1
+    if: ${{ !cancelled() && needs.pass1.outputs.done == 'false' && needs.pass1.outputs.quota == 'false' && inputs.mode != 'merge_only' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/scan-pass.yml
+    with:
+      pass: 2
+      folder: ${{ inputs.folder }}
+      include_albums: ${{ inputs.include_albums }}
+      mode: ${{ inputs.mode }}
+      clip_model: ${{ inputs.clip_model }}
+      workers: ${{ inputs.workers }}
+
+  pass3:
+    needs: pass2
+    if: ${{ !cancelled() && needs.pass2.outputs.done == 'false' && needs.pass2.outputs.quota == 'false' && inputs.mode != 'merge_only' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/scan-pass.yml
+    with:
+      pass: 3
+      folder: ${{ inputs.folder }}
+      include_albums: ${{ inputs.include_albums }}
+      mode: ${{ inputs.mode }}
+      clip_model: ${{ inputs.clip_model }}
+      workers: ${{ inputs.workers }}
+
+  merge:
+    needs: [plan, pass1, pass2, pass3]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && inputs.mode != 'probe' }}
+    runs-on: ubuntu-24.04
+    environment: photos
+    permissions:
+      contents: read
+    timeout-minutes: 120
+    env:
+      GPCLEAN_JOB: merge
+    outputs:
+      partial: ${{ steps.merge.outputs.partial }}
+      missing: ${{ steps.merge.outputs.missing }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/private"
+          echo "GPCLEAN_PRIVATE_DIR=$RUNNER_TEMP/private" >> "$GITHUB_ENV"
+          bash tools/install_tools.sh --rclone "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: sync
+        run: uv sync --locked --no-dev >>"$GPCLEAN_PRIVATE_DIR/setup.log" 2>&1
+      - name: decode drive credentials
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rc"
+          printf '%s' "$RCLONE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/rc/rclone.conf"
+          chmod 600 "$RUNNER_TEMP/rc/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/rc/rclone.conf" >> "$GITHUB_ENV"
+      - name: scope check
+        run: .venv/bin/python -m gpclean ci-scope-check 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: merge
+        id: merge
+        run: .venv/bin/python -m gpclean ci-merge 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
+      - name: upload private logs
+        if: always()
+        run: .venv/bin/python -m gpclean ci-upload-logs 3>/dev/null 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1 || true
+      - name: remove drive credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/rc"
+
+  # No Drive access and no secrets: turns the run red when the bundle is partial, the plan
+  # skipped unreadable zips, or a job stopped on a Drive quota (then it prints the UTC hour
+  # the quota resets).
+  report:
+    needs: [plan, pass1, pass2, pass3, merge]
+    if: ${{ !cancelled() && inputs.mode != 'probe' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    env:
+      GPCLEAN_JOB: report
+      GPCLEAN_PLAN_RESULT: ${{ needs.plan.result }}
+      GPCLEAN_MERGE_RESULT: ${{ needs.merge.result }}
+      GPCLEAN_PARTIAL: ${{ needs.merge.outputs.partial }}
+      GPCLEAN_MISSING: ${{ needs.merge.outputs.missing }}
+      GPCLEAN_BAD_ZIPS: ${{ needs.plan.outputs.bad_zips }}
+      GPCLEAN_QUOTA_PLAN: ${{ needs.plan.outputs.quota }}
+      GPCLEAN_QUOTA1: ${{ needs.pass1.outputs.quota }}
+      GPCLEAN_QUOTA2: ${{ needs.pass2.outputs.quota }}
+      GPCLEAN_QUOTA3: ${{ needs.pass3.outputs.quota }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/private"
+          echo "GPCLEAN_PRIVATE_DIR=$RUNNER_TEMP/private" >> "$GITHUB_ENV"
+          bash tools/install_tools.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: sync
+        run: uv sync --locked --no-dev >>"$GPCLEAN_PRIVATE_DIR/setup.log" 2>&1
+      - name: report
+        run: .venv/bin/python -m gpclean ci-report 3>&1 1>>"$GPCLEAN_PRIVATE_DIR/run.log" 2>&1
