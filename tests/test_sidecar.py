@@ -173,6 +173,9 @@ def test_parse_bad_url_dropped():
         (b"\xff\xfe\x00", "UnicodeDecodeError"),
         (b"[" * 100_000 + b"]" * 100_000, "RecursionError"),
     ],
+    # Short ids: the default id embeds the 200 KB payload, which overflows the
+    # 32767-char PYTEST_CURRENT_TEST environment variable on Windows.
+    ids=["bad-json", "empty", "list", "string", "bad-utf8", "deep-nesting"],
 )
 def test_parse_never_raises(data, err):
     out = parse_sidecar(data)

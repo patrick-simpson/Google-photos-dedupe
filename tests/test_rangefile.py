@@ -241,7 +241,7 @@ def test_seek_whence_and_errors(server, blob):
         assert f.read() == blob[-10:]
         assert f.seek(len(blob) + 5) == len(blob) + 5
         assert f.read(5) == b""  # past EOF reads nothing and sends nothing
-        with pytest.raises(ValueError):
+        with pytest.raises(OSError):  # like a real file (zipfile relies on this)
             f.seek(-1)
         with pytest.raises(ValueError):
             f.seek(0, 7)

@@ -28,6 +28,7 @@ never the URL (it names the user's files).
 
 from __future__ import annotations
 
+import errno
 import http.client
 import io
 import logging
@@ -158,7 +159,7 @@ class HTTPRangeFile(io.RawIOBase):
         else:
             raise ValueError(f"invalid whence ({whence})")
         if new < 0:
-            raise ValueError("negative seek position")
+            raise OSError(errno.EINVAL, "negative seek position")  # same as a real file; zipfile catches OSError
         self._pos = new
         return new
 
