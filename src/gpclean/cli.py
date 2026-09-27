@@ -31,6 +31,7 @@ _COMMANDS: dict[str, tuple[str, str]] = {
     "ci-merge": ("gpclean.ci", "cli_merge"),
     "ci-report": ("gpclean.ci", "cli_report"),
     "ci-scope-check": ("gpclean.ci", "cli_scope_check"),
+    "ci-upload-logs": ("gpclean.ci", "cli_upload_logs"),
     "selftest-upload": ("gpclean.ci", "cli_selftest_upload"),
     "probe": ("gpclean.probe", "cli_probe"),
 }
@@ -81,7 +82,7 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("--home", type=Path, required=True)
 
     for name in ("ci-plan", "ci-pending", "ci-finalize", "ci-merge", "ci-report",
-                 "ci-scope-check", "selftest-upload", "probe"):
+                 "ci-scope-check", "ci-upload-logs", "selftest-upload", "probe"):
         sub.add_parser(name, help="CI step (inputs from GPCLEAN_* env vars)")
     s = sub.add_parser("ci-scan", help="CI scan worker (inputs from GPCLEAN_* env vars)")
     s.add_argument("--worker", type=int, required=True)
